@@ -1,0 +1,20 @@
+# Top-level workspace for the milestone-1 spike. Both zkVM sides live as
+# nested workspaces because RISC Zero and SP1 each have their own build-time
+# requirements (RISC Zero generates guest method IDs via build.rs; SP1 ships
+# its own cargo subcommand for the program crate). Keeping them separate
+# avoids fighting either tool's conventions.
+#
+# This top-level workspace only contains the bench driver. Day 1 of the
+# spike: replace the placeholder bench crate with a real one that shells
+# out to both sides.
+
+[workspace]
+resolver = "2"
+members = [
+    "bench-driver",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+publish = false

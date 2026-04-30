@@ -1,0 +1,13 @@
+[package]
+name = "snarkvid-spike-bench-driver"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "bench-driver"
+path = "src/main.rs"
+
+[dependencies]
+# Pure-stdlib for now; if/when we need richer reporting, add serde + serde_json.

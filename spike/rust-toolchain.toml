@@ -1,0 +1,8 @@
+# Pin on day 1 of the spike. Each zkVM has its own preferred toolchain;
+# the host workspace just needs to be compatible with both.
+#
+# RISC Zero currently tracks stable Rust; SP1 currently tracks a recent
+# nightly for its guest. Verify against upstream READMEs before pinning.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
