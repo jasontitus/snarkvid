@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>snarkvid spike — verifier</title>
+  </head>
+  <body>
+    <h1>snarkvid spike — milestone 1 verifier</h1>
+    <p>Drop a proof file and paste the SHA-256 commitment hex.</p>
+
+    <label>System:
+      <select id="system">
+        <option value="risc0">RISC Zero</option>
+        <option value="sp1">SP1</option>
+      </select>
+    </label>
+
+    <p><label>Proof file: <input type="file" id="proof" /></label></p>
+    <p><label>Commitment (hex): <input type="text" id="commit" size="68" /></label></p>
+    <p><label>Min size: <input type="number" id="min-size" value="1024" /></label></p>
+
+    <button id="go">Verify</button>
+
+    <pre id="result"></pre>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
