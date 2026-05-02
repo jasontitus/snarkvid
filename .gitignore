@@ -1,0 +1,10 @@
+target/
+**/target/
+
+corpus/
+test-vectors/*.bin
+test-vectors/*.h264
+test-vectors/*.yuv
+
+*.proof
+*.receipt

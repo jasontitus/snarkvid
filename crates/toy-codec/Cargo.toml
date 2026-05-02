@@ -1,0 +1,16 @@
+[package]
+name = "snarkvid-toy-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+# Hand-rolled Display so the decoder stays no_std-compatible.
+

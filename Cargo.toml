@@ -1,0 +1,36 @@
+# Root workspace for snarkvid native crates (milestones 2 and 3).
+#
+# The zkVM-side workspaces under spike/risc0/ and spike/sp1/ are independent
+# nested workspaces (they have their own RISC-V build toolchains and Cargo
+# conventions). Everything else lives here.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/comparator",
+    "crates/manifest",
+    "crates/toy-codec",
+    "crates/m2-statement",
+    "bin/toy-encode",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.0.0"
+publish = false
+
+[workspace.dependencies]
+# Shared deps; each crate opts in.
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+rand = { version = "0.8", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.10", default-features = false }
+thiserror = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

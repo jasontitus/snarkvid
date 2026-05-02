@@ -1,0 +1,12 @@
+[package]
+name = "snarkvid-comparator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+
+[dependencies]
+# Intentionally no_std; lives entirely on stack-allocated slices so the
+# same code runs natively and inside a zkVM guest.

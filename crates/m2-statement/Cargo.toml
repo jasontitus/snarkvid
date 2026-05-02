@@ -1,0 +1,17 @@
+[package]
+name = "snarkvid-m2-statement"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+
+[dependencies]
+snarkvid-comparator = { path = "../comparator" }
+snarkvid-manifest = { path = "../manifest" }
+snarkvid-toy-codec = { path = "../toy-codec" }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+rand = { workspace = true, features = ["std", "std_rng"] }
