@@ -396,6 +396,10 @@ name = "snarkvid-comparator"
 version = "0.0.0"
 
 [[package]]
+name = "snarkvid-h264-decoder"
+version = "0.0.0"
+
+[[package]]
 name = "snarkvid-m2-statement"
 version = "0.0.0"
 dependencies = [

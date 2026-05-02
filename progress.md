@@ -140,12 +140,63 @@ bin/
 
 ---
 
+## 2026-05-02 — Milestone 3 starting: corpus + bitreader + NAL framer
+
+### H.264 test corpus
+
+`test-vectors/gen.sh` produces five baseline-profile I-frame-only
+fixtures via `ffmpeg -c:v libx264 -profile:v baseline -x264-params
+"keyint=1:bframes=0:cabac=0:no-deblock=1:..."`:
+
+| Fixture | Size | .h264 | .dec.yuv |
+|---|---|---|---|
+| `solid_16x16` | 16x16 | 652 B | 384 B |
+| `diag_16x16` | 16x16 | 773 B | 384 B |
+| `checker_32x16` | 32x16 | 848 B | 768 B |
+| `grad_32x32` | 32x32 | 691 B | 1536 B |
+| `smooth_64x64` | 64x64 | 2226 B | 6144 B |
+
+For each fixture we keep both the H.264 bitstream and the
+ffmpeg-decoded YUV. Our decoder must produce byte-identical output to
+the latter — note that this is *not* the original raw input, since the
+encoder is lossy.
+
+ffprobe confirms each fixture is a single Constrained Baseline access
+unit, exactly what milestone 3's scope demands.
+
+### crates/h264-decoder skeleton
+
+Bottom-up, each module independently testable:
+
+| Module | Tests | Status |
+|---|---|---|
+| `bitreader` | 11 | done — Exp-Golomb tested against spec §9.1 Table 9-1 |
+| `nal` | 8 | done — NAL framer + emulation-prevention strip |
+| `corpus_nalu` (integration) | 2 | done — every fixture parses to the expected NAL types |
+| `slice` (header) | — | next |
+| `cavlc` | — | pending |
+| `transform` + `quant` | — | pending |
+| `intra` | — | pending |
+| `mb` + `frame` | — | pending |
+
+21 tests pass. `no_std` discipline maintained (uses
+`extern crate alloc` and `core::error::Error`).
+
+### Issues encountered
+
+- `vec!` macro isn't auto-imported under `#![no_std]` even with
+  `extern crate alloc` — tests need `use alloc::vec`.
+- `Nalu` would have to derive `PartialEq` to support `assert_eq!` on a
+  `Result<Vec<Nalu>, _>` — replaced with `matches!` instead.
+
+---
+
 ## Status by milestone
 
 | Milestone | Status |
 |---|---|
 | 1 — zkVM spike | **deferred** (sandbox network blocks rzup / sp1up) |
 | 2 — Toy transform (native) | **complete** — 34 tests, CLI smoke-tested |
-| 3 — H.264 I-frame decoder (native) | next |
+| 3 — H.264 I-frame decoder (native) | in progress — corpus + bitreader + NAL (21 tests) |
 | 4 — P-frames + audio + aggregation | not started |
 | 5 — Hardening | not started |
