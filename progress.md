@@ -140,6 +140,93 @@ bin/
 
 ---
 
+## 2026-05-02 — Milestone 3 partial: parser stack + transform + quant
+
+Stopping here on milestone 3 with seven of nine modules landed. The
+remaining two (CAVLC entropy + intra prediction + MB layer + frame
+loop) are weeks of careful spec implementation that I can't do justice
+to in a single session, and shipping a half-finished CAVLC decoder
+would be worse than no CAVLC decoder at all. Honest accounting below.
+
+### What's done
+
+| Module | Tests | Spec section |
+|---|---|---|
+| `bitreader` | 11 | §9.1 (Exp-Golomb), §7.2 (more_rbsp_data) |
+| `nal` | 8 unit + 2 corpus | §7.3.1, §7.4.1.2.3 |
+| `sps` | 1 + corpus | §7.3.2.1 |
+| `pps` | 2 + corpus | §7.3.2.2 |
+| `slice` (header) | corpus | §7.3.3 |
+| `transform` | 5 | §8.5.10, §8.5.11 |
+| `quant` | 6 | §8.5.12.2 |
+
+The corpus parity test (`tests/corpus_param_sets.rs`) round-trips SPS
++ PPS + slice header against all five fixtures and confirms:
+
+- profile_idc = 66 (baseline)
+- pic_width / pic_height match the .meta records
+- entropy_coding_mode_flag = 0 (CAVLC)
+- single slice group
+- frame_mbs_only_flag = 1
+- first_mb_in_slice = 0
+- slice_type = I
+- slice_qp ∈ [0, 51]
+
+**36 tests pass across the decoder**; 70 tests pass across the whole
+workspace.
+
+### What's left (and what it would take)
+
+| Module | Estimated effort | Why it's the bottleneck |
+|---|---|---|
+| `cavlc` | 3–5 engineer-days | Five lookup tables (`coeff_token`, `total_zeros`, `run_before`, level prefix, level suffix), each ~100 entries with context-dependent selection. Has to match the spec bit-for-bit; off-by-one in any table breaks everything. Needs a hand-crafted test corpus of bit-flipped CAVLC streams to validate. |
+| `intra` | 1–2 days | 9 Intra_4x4 modes + 4 Intra_16x16 + 4 chroma 8x8. Mode-dependent neighbor pixel availability (`p[-1, -1]` etc.) makes the MB-boundary handling fiddly. |
+| `mb` (layer) | 2–3 days | Glue between everything: parse `mb_type`, choose prediction modes, decode CAVLC residuals, dequantize, inverse transform, add to prediction. Lots of small spec branches. |
+| `frame` (loop) | 1 day | Iterate MBs in raster order, manage neighbor pixel buffers (one MB above + one MB to the left), track running QP from `mb_qp_delta`. |
+| ffmpeg parity test | 1 day | The gold-standard test: feed each fixture's `.h264` to our decoder, compare byte-by-byte against `<fixture>.dec.yuv`. Needs all of the above working. |
+
+Total realistic estimate to first byte-exact decode of `solid_16x16`:
+**~7–10 engineer-days** of careful, spec-verified work, more like 3–4
+weeks accounting for the differential-fuzzing pass that the milestone
+plan calls out.
+
+### Issues encountered this session
+
+- Had to add explicit `'a` lifetime to `parse_slice_header` because
+  the `BitReader<'a>` return value needs to track the input slice's
+  lifetime — Rust 2021 can't infer through an `&[u8]` parameter to a
+  named generic struct.
+- Initial `idct_inverts_fdct_to_within_scale` test was fundamentally
+  wrong: I assumed forward + inverse without dequantization gives back
+  `input * 64`, but the H.264 forward and inverse integer transforms
+  are *not* exact inverses of each other — the missing scale factor
+  is absorbed into the dequantization step (the per-position
+  `NORMALIZE_ADJUST[qp%6]` multipliers in `quant.rs`). Fixed by
+  testing the inverse independently against known-correct
+  transform-domain inputs.
+- CAVLC and the intra-predict modes are where the spec genuinely
+  rewards careful reading; I'm declining to rush them.
+
+### Recommended path forward
+
+1. **Resume milestone 1 first** when an environment with unrestricted
+   GitHub releases (or a `GITHUB_TOKEN`) is available. The zkVM
+   selection determines which `no_std` constraints we'll hit, which
+   in turn shapes how the CAVLC tables get encoded (e.g.,
+   const arrays vs. lazy_static).
+2. **Build CAVLC bottom-up with table-by-table tests**, transcribing
+   spec Tables 9-5 through 9-9 directly. Add a fuzz harness comparing
+   against ffmpeg's `cavlc.c` reference early.
+3. **Skip intra prediction for the first end-to-end test** by
+   working with a fixture whose MBs are all `I_PCM` (escape mode that
+   bypasses prediction and CAVLC entirely — emit raw pixels). This
+   gets a first byte-exact decode of *something* before the full
+   pipeline lands.
+4. **Then layer in Intra_16x16 → Intra_4x4 → chroma 8x8**, each gated
+   on a corresponding fixture in the test corpus.
+
+---
+
 ## 2026-05-02 — Milestone 3 starting: corpus + bitreader + NAL framer
 
 ### H.264 test corpus
@@ -197,6 +284,6 @@ Bottom-up, each module independently testable:
 |---|---|
 | 1 — zkVM spike | **deferred** (sandbox network blocks rzup / sp1up) |
 | 2 — Toy transform (native) | **complete** — 34 tests, CLI smoke-tested |
-| 3 — H.264 I-frame decoder (native) | in progress — corpus + bitreader + NAL (21 tests) |
+| 3 — H.264 I-frame decoder (native) | **partial** — parser stack + transform + quant (36 tests). CAVLC / intra / MB / frame loop pending. |
 | 4 — P-frames + audio + aggregation | not started |
 | 5 — Hardening | not started |

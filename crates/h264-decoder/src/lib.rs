@@ -19,6 +19,14 @@ extern crate alloc;
 pub mod bitreader;
 pub mod error;
 pub mod nal;
+pub mod pps;
+pub mod quant;
+pub mod slice;
+pub mod sps;
+pub mod transform;
 
 pub use error::DecodeError;
 pub use nal::{iter_nalus, nal_unit_type, NalHeader, Nalu};
+pub use pps::{parse_pps, Pps};
+pub use slice::{parse_slice_header, SliceHeader, SliceType};
+pub use sps::{parse_sps, profile, Sps};
