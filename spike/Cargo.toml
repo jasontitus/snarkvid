@@ -13,6 +13,11 @@ resolver = "2"
 members = [
     "bench-driver",
 ]
+exclude = [
+    "risc0",
+    "sp1",
+    "sp1/program",
+]
 
 [workspace.package]
 edition = "2021"

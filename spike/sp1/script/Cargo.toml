@@ -1,22 +1,23 @@
 [package]
 name = "snarkvid-spike-sp1-script"
-version = "0.0.0"
-edition.workspace = true
-license.workspace = true
-publish.workspace = true
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
 
 [[bin]]
 name = "sp1-script"
 path = "src/main.rs"
 
 [dependencies]
-# sp1-sdk = { workspace = true }
-# clap = { workspace = true }
-# anyhow = { workspace = true }
-# serde = { workspace = true }
-# serde_json = { workspace = true }
-# sha2 = { workspace = true }
+sp1-sdk = { workspace = true }
+sha2 = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
-[features]
-default = []
-gpu = [] # forwards to sp1-sdk's GPU prover once wired
+[build-dependencies]
+sp1-build = { workspace = true }

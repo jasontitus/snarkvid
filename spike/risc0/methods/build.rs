@@ -1,11 +1,7 @@
-// Day 1 of the spike: replace this with the standard risc0-build invocation.
-//
-// fn main() {
-//     risc0_build::embed_methods();
-// }
+// Build script for the RISC Zero methods crate.
+// Compiles the guest program(s) into RISC-V ELF binaries and generates
+// the image ID constants that the host crate uses for proof verification.
 
 fn main() {
-    println!(
-        "cargo:warning=spike scaffold — wire risc0_build::embed_methods() per https://docs.risczero.com"
-    );
+    risc0_build::embed_methods();
 }

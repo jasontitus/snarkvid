@@ -164,6 +164,62 @@ Proving a 10-second clip in a single proof is infeasible. Architecture:
 
 This also gives us GPU parallelism: chunk proofs run concurrently on independent workers.
 
+## 9.1 Chunking strategy and resource estimates
+
+### The problem: a single proof for a full video is impossible
+
+| | 4K @30fps, 1 min (H.264 compressed) |
+|---|---|
+| Compressed size | ~150 MB |
+| Raw frames (witness) | ~44.8 GB (1,800 × 24.9 MB) |
+| Extrapolated cycles | ~13.5 trillion |
+| Extrapolated prove time (CPU) | ~14 years |
+| Extrapolated peak RAM | ~2.7 TB |
+
+These numbers come from linearly extrapolating the milestone-1 spike benchmark (SHA-256 over raw bytes) on SP1:
+
+| Input size | Cycles | Prove time | Peak RAM |
+|---|---|---|---|
+| 1 KB | ~90K | 26 s | ~8 GB |
+| 1 MB | ~90M | ~43 min (projected) | ~18 GB |
+| 10 MB | ~900M | ~7 hours (projected) | ~100 GB+ |
+| 150 MB | ~13.5T | ~14 years | ~2.7 TB |
+
+The prover memory scales roughly linearly with trace size because the zkVM holds the full execution trace in RAM during proving. The cycle count is similarly linear — SHA-256 is O(n) over the input bytes.
+
+### The solution: chunk to 1–5 MB, aggregate via recursion
+
+A single I-frame at 4K is ~24.9 MB raw, too large for a single proof on consumer hardware. So we chunk further:
+
+- **Spatial tiling** — split each frame into tiles (e.g., 4×4 = 16 tiles of ~1.5 MB each). Each tile gets its own proof committing to a sub-Merkle root.
+- **Temporal chunking** — prove per-GOP (keyframe + following P-frames). A typical GOP is 30–60 frames.
+- **Merkle tree structure** — tiles → frame root → GOP root → video root. Each level is a small Merkle proof that the zkVM can verify cheaply.
+
+This means the **largest single proof** is ~1–5 MB of witness data, which from the spike data needs:
+
+- **~18–100 GB RAM** for the prover (manageable on cloud GPU instances)
+- **~43 min to 7 hours** CPU prove time per chunk (GPU will reduce 10–50×)
+- **~90M–450M cycles** per chunk
+
+### Practical numbers for a 1-minute 4K video
+
+Assuming 4×4 spatial tiling (16 tiles/frame), 30 fps:
+
+| Metric | Value |
+|---|---|
+| Total tiles (chunks) | 1,800 frames × 16 = **28,800** |
+| RAM per chunk | **18–50 GB** |
+| Prove time per chunk (GPU, est.) | **1–10 min** |
+| Total prove time (32 parallel workers) | **~3–15 hours** |
+| Aggregated proof size | **~1–2 KB** (constant after recursion) |
+| Browser verify time | **<2 s** |
+
+The 32 parallel workers run on independent GPU instances (e.g., AWS g5.xlarge or equivalent). Total compute cost is roughly $5–20 per video depending on GPU pricing.
+
+### Key insight
+
+The recursion step is the key to making this tractable. Without it, you'd ship 28,800 individual proofs (~70 MB total). With it, you ship one constant-size proof. The recursion prover is itself a small circuit that verifies a single child proof and accumulates state — it takes seconds to run and negligible memory.
+
 ## 10. Components
 
 ### 10.1 Original signing format
@@ -214,6 +270,9 @@ The Merkle leaves are individual frames (raw YUV planes) and audio windows (raw 
 ## 11. Milestones
 
 1. **Spike (1–2 wk).** End-to-end "hello world": prove SHA-256 of a file in the chosen zkVM, verify in the browser via WASM. Validates the verifier UX and proof-size budget. Picks RISC Zero vs SP1.
+
+   **Status: partial.** SP1 guest + host built, 1 KB proof/verify working (26s prove, 110ms verify, 2.7 MB proof). 1 MB+ OOMs on 32 GB machine — requires GPU instance or swap. RISC Zero side scaffolded but toolchain unavailable on this machine (Linux/ARM64 needs source build). Browser verifier scaffold exists. Spike is blocked on GPU hardware for 1 MB and 10 MB data points.
+
 2. **Toy transform (3–4 wk).** Prove `decoded_pixels(downscale_2x(compressed)) ≈ original` on a single still image. Real Merkle hashing, real signature check, no codec yet.
 3. **Baseline H.264 I-frame (2–3 mo).** In-circuit decoder for I-frames only, single slice, no deblocking. Per-frame proof.
 4. **P-frames + audio + GPU (1–2 mo).** Add motion compensation and AAC-LC. Move to GPU prover. Recursive aggregation across a GOP.
@@ -223,12 +282,13 @@ The milestone-1 spike is the **go/no-go gate.** If proof times for SHA-256 + a t
 
 ## 12. Open questions
 
-- **Proof system pick:** RISC Zero vs SP1 — settle in milestone 1.
+- **Proof system pick:** RISC Zero vs SP1 — settle in milestone 1. SP1 is further along (working end-to-end on 1 KB). RISC Zero side scaffolded but needs toolchain.
 - **Original signing format:** C2PA vs custom. C2PA gives ecosystem alignment; custom gives a tighter binding to our Merkle layout.
-- **Hash inside the circuit:** Poseidon (smaller circuit, less ecosystem) vs Blake3 / SHA-256 (larger circuit, broader tooling).
-- **Frame chunking granularity:** per-frame vs per-GOP — affects parallelism vs proof overhead.
+- **Hash inside the circuit:** Poseidon (smaller circuit, less ecosystem) vs Blake3 / SHA-256 (larger circuit, broader tooling). Spike uses SHA-256 for measurement; production will likely switch to Poseidon for Merkle verification and Blake3 for general hashing.
+- **Frame chunking granularity:** spatial tiling (4×4 per frame) vs temporal chunking (per-GOP) vs hybrid. Spatial tiling gives smaller individual proofs (~1.5 MB) but more proofs to aggregate. See §9.1 for estimates.
 - **Tolerance defaults:** what PSNR / audio-SNR floor matches "visually and audibly indistinguishable" for the target content type (camera footage vs talking head vs screen capture).
 - **Color space + chroma subsampling:** the comparator must handle YUV 4:2:0 correctly; decide whether to compare in YUV or RGB.
+- **GPU prover availability:** SP1 CPU prover OOMs at ~18 GB for 1 MB input. 10 MB+ requires a GPU instance (T4/L4/A10) with 24+ GB VRAM. RISC Zero GPU prover status needs checking against current toolchain.
 
 ## 13. Out of scope for v1
 
