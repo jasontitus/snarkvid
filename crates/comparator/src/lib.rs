@@ -15,6 +15,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 #[cfg(feature = "std")]
 extern crate std;
 
@@ -165,6 +167,7 @@ pub fn frame_psnr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn identical_frames_infinite_psnr() {

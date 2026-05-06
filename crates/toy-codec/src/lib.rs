@@ -64,6 +64,22 @@ pub enum ToyCodecError {
     Unsupported,
 }
 
+#[cfg(feature = "std")]
+impl std::error::Error for ToyCodecError {}
+
+#[cfg(feature = "std")]
+impl core::fmt::Display for ToyCodecError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidDimensions => write!(f, "frame dimensions must be multiples of 16"),
+            Self::InvalidChromaFormat => write!(f, "only 4:2:0 chroma format is supported"),
+            Self::BufferTooSmall => write!(f, "coefficient buffer size doesn't match frame dimensions"),
+            Self::CoefficientOverflow => write!(f, "coefficient value out of range"),
+            Self::Unsupported => write!(f, "unsupported codec parameter"),
+        }
+    }
+}
+
 /// Encode a YUV frame into a BlockQuant bitstream.
 ///
 /// The caller picks a QP (0 = lossless-ish, 51 = heaviest quantization).
@@ -158,6 +174,7 @@ pub fn decode_toy(bitstream: &BqBitstream) -> Result<YuvFrame, ToyCodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     /// Stub test — replace with real test vectors on milestone 2 day 1.
     #[test]

@@ -94,7 +94,7 @@ fn run_side(
 
     // Read the JSON output from the result file
     match std::fs::read_to_string(out_path) {
-        Ok(json_str) => match serde_json::from_str(&json_str) {
+        Ok(json_str) => match serde_json::from_str::<serde_json::Value>(&json_str) {
             Ok(val) => {
                 println!("  {} OK — {} rows", name, val["rows"].as_array().map_or(0, |r| r.len()));
                 Some(val)

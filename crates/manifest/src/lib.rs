@@ -244,6 +244,7 @@ pub fn verify_merkle_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn merkle_root_single_leaf() {
