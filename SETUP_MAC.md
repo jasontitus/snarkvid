@@ -120,9 +120,11 @@ log "Installing SP1 RISC-V toolchain..."
 cargo prove install 2>&1 | tail -5
 
 # ---- Install RISC Zero toolchain ----
-log "Installing cargo-risczero..."
+log "Installing cargo-risczero (v1.2, CPU-only)..."
 if ! command -v cargo-risczero &>/dev/null; then
-    cargo install cargo-risczero 2>&1 | tail -3
+    # Pin v1.2 — v3.x has a completely different API and our code targets 1.x.
+    # Skip Metal GPU kernels since we're doing CPU benchmarks.
+    RISC0_SKIP_BUILD_KERNELS=1 cargo install cargo-risczero --version "^1.2" 2>&1 | tail -3
 fi
 
 log "Installing RISC Zero RISC-V toolchain (prebuilt for Apple Silicon)..."
@@ -233,6 +235,27 @@ log "Done! Save the output above and use it to fill in DECISION.md."
 -------------------------------------------------------------------------------
 
 ## Manual steps if the script fails
+
+### If `cargo install cargo-risczero` fails with "missing Metal Toolchain"
+
+This happens when cargo installs v3.x instead of v1.2. Fix:
+
+```bash
+# Clean up the partial v3 install
+rm -rf ~/.cargo/bin/cargo-risczero
+
+# Install v1.2 with Metal kernels skipped (CPU-only benchmarks)
+RISC0_SKIP_BUILD_KERNELS=1 cargo install cargo-risczero --version "^1.2"
+
+# Then install the RISC-V toolchain
+cargo risczero install
+```
+
+If you want GPU (Metal) proving later, install the Metal toolchain first:
+```bash
+xcodebuild -downloadComponent MetalToolchain
+# Then reinstall without RISC0_SKIP_BUILD_KERNELS
+```
 
 ### If `cargo prove install` fails
 ```bash
