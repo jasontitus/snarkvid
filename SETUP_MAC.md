@@ -111,13 +111,12 @@ if [[ ! -f "DESIGN.md" ]]; then
 fi
 
 # ---- Install SP1 toolchain ----
-log "Installing cargo-prove (SP1 CLI)..."
+log "Installing SP1 toolchain (sp1up)..."
 if ! command -v cargo-prove &>/dev/null; then
-    cargo install cargo-prove 2>&1 | tail -3
+    curl -L https://sp1.succinct.xyz | bash
+    # sp1up installs cargo-prove + the RISC-V toolchain
+    sp1up 2>&1 | tail -5
 fi
-
-log "Installing SP1 RISC-V toolchain..."
-cargo prove install 2>&1 | tail -5
 
 # ---- Install RISC Zero toolchain ----
 log "Installing cargo-risczero (v1.2, CPU-only)..."
@@ -257,12 +256,18 @@ xcodebuild -downloadComponent MetalToolchain
 # Then reinstall without RISC0_SKIP_BUILD_KERNELS
 ```
 
-### If `cargo prove install` fails
+### If `cargo prove` isn't found / "no such command"
+
 ```bash
-# Alternative: use sp1up
+# Install sp1up (the SP1 toolchain manager)
 curl -L https://sp1.succinct.xyz | bash
 sp1up
+
+# This installs cargo-prove (the cargo subcommand) and the RISC-V toolchain.
+# After this, `cargo prove --version` should work.
 ```
+
+### If `sp1up` fails
 
 ### If RISC Zero deps aren't uncommented
 Manually edit these three files and remove the `# ` prefix from lines starting with `# risc0`, `# bincode`, or `# snarkvid`:
