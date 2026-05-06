@@ -21,3 +21,7 @@ tracing = { workspace = true }
 
 [build-dependencies]
 sp1-build = { workspace = true }
+
+[features]
+default = []
+cuda = ["sp1-sdk/cuda"]  # GPU prover (Linux + NVIDIA)
