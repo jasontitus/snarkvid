@@ -1,0 +1,25 @@
+# Rust
+target/
+*.rs.bk
+*.profraw
+*.profdata
+
+# JavaScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Bench fixtures (regenerate with spike/common/bench-fixtures/gen.sh)
+spike/common/bench-fixtures/fixture-*.bin
+spike/common/bench-fixtures/fixture-*.bin.sha256
+
+# Bench results
+spike/bench/results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pi review artifacts
+.pi-review.log
+PI_REVIEW.md

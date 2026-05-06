@@ -5,75 +5,49 @@
 //   risc0-host verify  --proof proof.bin --commit <hex> --min-size <N>
 //   risc0-host bench   --fixture-dir ../common/bench-fixtures --out bench.json
 //
-// Bench output schema (consumed by ../bench/compare.py):
-//   {
-//     "system": "risc0",
-//     "toolchain": "<version>",
-//     "gpu": "<device or null>",
-//     "rows": [
-//       { "size_bytes": 1024, "cycles": ..., "prove_ms": ..., "verify_ms": ...,
-//         "proof_bytes": ..., "peak_rss_bytes": ... },
-//       ...
-//     ]
-//   }
+// Requires risc0-zkvm to be available (uncomment deps in Cargo.toml and
+// rebuild with --features risc0). Without it, prints a helpful error.
 
+// ---------------------------------------------------------------------------
+// Without the "risc0" feature, print a helpful error and exit.
+// ---------------------------------------------------------------------------
+#[cfg(not(feature = "risc0"))]
+fn main() {
+    eprintln!("RISC Zero host: toolchain not available on this machine.");
+    eprintln!();
+    eprintln!("To enable the RISC Zero side:");
+    eprintln!("  1. Install risc0-zkvm (see https://dev.risczero.com/api/zkvm/install)");
+    eprintln!("  2. Uncomment risc0-zkvm deps in spike/risc0/{host,methods,methods/guest}/Cargo.toml");
+    eprintln!("  3. Rebuild with: cargo build --release --features risc0");
+    eprintln!();
+    eprintln!("Meanwhile, use the SP1 side:");
+    eprintln!("  cd spike/sp1 && cargo run --release -- prove --input <file> --min-size <N> --out proof.bin");
+    std::process::exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Full implementation when the "risc0" feature is enabled.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "risc0")]
 use anyhow::{Context, Result};
+#[cfg(feature = "risc0")]
 use clap::{Parser, Subcommand};
-use risc0_zkvm::{default_prover_server, ExecutorEnv, Receipt, VerifierContext};
+#[cfg(feature = "risc0")]
+use risc0_zkvm::{default_prover, ExecutorEnv, Receipt, VerifierContext};
+#[cfg(feature = "risc0")]
 use serde::Serialize;
+#[cfg(feature = "risc0")]
 use sha2::{Digest, Sha256};
-use snarkvid_spike_risc0_methods::SHA256_PREIMAGE_ELF;
+#[cfg(feature = "risc0")]
+use snarkvid_spike_risc0_methods::{SHA256_PREIMAGE_ELF, SHA256_PREIMAGE_ID};
+#[cfg(feature = "risc0")]
 use std::path::PathBuf;
+#[cfg(feature = "risc0")]
 use std::time::Instant;
 
-/// RISC Zero host for the snarkvid milestone-1 spike.
-#[derive(Parser)]
-#[command(name = "risc0-host")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Prove SHA-256 preimage knowledge
-    Prove {
-        /// Input fixture file (private witness)
-        #[arg(long)]
-        input: PathBuf,
-        /// Minimum size constraint
-        #[arg(long)]
-        min_size: u32,
-        /// Output proof file
-        #[arg(long)]
-        out: PathBuf,
-        /// Output commitment hex file
-        #[arg(long)]
-        commit_out: Option<PathBuf>,
-    },
-    /// Verify a proof
-    Verify {
-        /// Proof (receipt) file
-        #[arg(long)]
-        proof: PathBuf,
-        /// Expected commitment hex
-        #[arg(long)]
-        commit: String,
-        /// Expected min size
-        #[arg(long)]
-        min_size: u32,
-    },
-    /// Run benchmarks on all fixtures
-    Bench {
-        /// Directory containing fixture files
-        #[arg(long)]
-        fixture_dir: PathBuf,
-        /// Output JSON file
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
-}
-
+// ---------------------------------------------------------------------------
+// Shared types and helpers (available in both modes for future use)
+// ---------------------------------------------------------------------------
 #[derive(Serialize)]
 struct BenchResult {
     system: String,
@@ -131,6 +105,50 @@ fn get_peak_rss() -> usize {
     0
 }
 
+// ---------------------------------------------------------------------------
+// CLI and implementation
+// ---------------------------------------------------------------------------
+#[cfg(feature = "risc0")]
+#[derive(Parser)]
+#[command(name = "risc0-host")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[cfg(feature = "risc0")]
+#[derive(Subcommand)]
+enum Commands {
+    /// Prove SHA-256 preimage knowledge
+    Prove {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        min_size: u32,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        commit_out: Option<PathBuf>,
+    },
+    /// Verify a proof
+    Verify {
+        #[arg(long)]
+        proof: PathBuf,
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        min_size: u32,
+    },
+    /// Run benchmarks on all fixtures
+    Bench {
+        #[arg(long)]
+        fixture_dir: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[cfg(feature = "risc0")]
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -155,44 +173,28 @@ fn main() -> Result<()> {
                 .build()
                 .context("failed to build executor env")?;
 
-            let session = default_prover_server()
-                .execute(env)
-                .assume_verified()
-                .run()
-                .context("execution failed")?;
-
-            // Verify public values match
-            let mut executor = risc0_zkvm::vm::Executor::from_elf(
-                ExecutorEnv::builder().build().context("failed to build verify env")?,
-                &risc0_zkvm::elf::Elf::load(SHA256_PREIMAGE_ELF)
-                    .context("failed to load ELF")?,
-            )
-            .context("failed to create executor")?;
-
+            let prover = default_prover();
             let t0 = Instant::now();
-            let receipt = default_prover_server()
-                .prove_env(env)
-                .context("failed to build prover env")?
-                .run()
+            let receipt = prover
+                .prove(env, SHA256_PREIMAGE_ELF)
                 .context("prove failed")?;
             let prove_ms = t0.elapsed().as_millis() as u64;
 
-            // Extract and verify public values from receipt
-            let pv: risc0_zkvm::Journal = receipt.journal;
-            let pv_bytes = pv.bytes.as_slice();
-            let pv_digest: [u8; 32] = pv_bytes[..32]
-                .try_into()
-                .context("journal too short for digest")?;
-            let pv_min_size: u32 = u32::from_le_bytes(
-                pv_bytes[32..36]
-                    .try_into()
-                    .context("journal too short for min_size")?,
-            );
+            // Verify the receipt
+            receipt
+                .verify(SHA256_PREIMAGE_ID)
+                .context("self-verify failed")?;
+
+            // Extract and verify public values from journal
+            let pv_bytes = receipt.journal.bytes.as_slice();
+            anyhow::ensure!(pv_bytes.len() >= 36, "journal too short");
+            let pv_digest: [u8; 32] = pv_bytes[..32].try_into().unwrap();
+            let pv_min_size: u32 = u32::from_le_bytes(pv_bytes[32..36].try_into().unwrap());
 
             anyhow::ensure!(pv_digest == commitment, "public value digest mismatch");
             anyhow::ensure!(pv_min_size == min_size, "public value min_size mismatch");
 
-            // Save receipt
+            // Serialize and save receipt
             let proof_bytes = bincode::serialize(&receipt)
                 .context("failed to serialize receipt")?;
             std::fs::write(&out, &proof_bytes).context("failed to save proof")?;
@@ -216,22 +218,16 @@ fn main() -> Result<()> {
                 bincode::deserialize(&proof_bytes).context("failed to deserialize receipt")?;
 
             let t0 = Instant::now();
-            let ctx = VerifierContext::default();
             receipt
-                .verify(&ctx, snarkvid_spike_risc0_methods::SHA256_PREIMAGE_ID)
+                .verify(SHA256_PREIMAGE_ID)
                 .context("verification failed")?;
             let verify_ms = t0.elapsed().as_millis() as u64;
 
             // Verify public values
             let pv_bytes = receipt.journal.bytes.as_slice();
-            let pv_digest: [u8; 32] = pv_bytes[..32]
-                .try_into()
-                .context("journal too short for digest")?;
-            let pv_min_size: u32 = u32::from_le_bytes(
-                pv_bytes[32..36]
-                    .try_into()
-                    .context("journal too short for min_size")?,
-            );
+            anyhow::ensure!(pv_bytes.len() >= 36, "journal too short");
+            let pv_digest: [u8; 32] = pv_bytes[..32].try_into().unwrap();
+            let pv_min_size: u32 = u32::from_le_bytes(pv_bytes[32..36].try_into().unwrap());
 
             anyhow::ensure!(
                 pv_digest == *expected_commitment.as_slice(),
@@ -244,6 +240,7 @@ fn main() -> Result<()> {
         Commands::Bench { fixture_dir, out } => {
             let sizes = [("1k", 1024), ("1m", 1_048_576), ("10m", 10_485_760)];
             let mut rows = Vec::new();
+            let prover = default_prover();
 
             for (label, _size) in sizes {
                 let fixture = fixture_dir.join(format!("fixture-{}.bin", label));
@@ -255,33 +252,36 @@ fn main() -> Result<()> {
                 let data = std::fs::read(&fixture).context(format!("read {}", fixture.display()))?;
                 let min_size = data.len() as u32;
 
-                let env = ExecutorEnv::builder()
+                // Build env for execution (to count cycles)
+                let exec_env = ExecutorEnv::builder()
                     .write(&min_size)
                     .write(&data)
                     .build()
                     .context("failed to build executor env")?;
 
                 // Execute to get cycle count
-                let session = default_prover_server()
-                    .execute(env.clone())
-                    .assume_verified()
-                    .run()
+                let session = prover
+                    .execute(exec_env, SHA256_PREIMAGE_ELF)
                     .context("execute failed")?;
+
+                // Build a fresh env for proving (env is consumed by execute)
+                let prove_env = ExecutorEnv::builder()
+                    .write(&min_size)
+                    .write(&data)
+                    .build()
+                    .context("failed to build prover env")?;
 
                 // Prove
                 let t0 = Instant::now();
-                let receipt = default_prover_server()
-                    .prove_env(env)
-                    .context("failed to build prover env")?
-                    .run()
+                let receipt = prover
+                    .prove(prove_env, SHA256_PREIMAGE_ELF)
                     .context("prove failed")?;
                 let prove_ms = t0.elapsed().as_millis() as u64;
 
                 // Verify
                 let t1 = Instant::now();
-                let ctx = VerifierContext::default();
                 receipt
-                    .verify(&ctx, snarkvid_spike_risc0_methods::SHA256_PREIMAGE_ID)
+                    .verify(SHA256_PREIMAGE_ID)
                     .context("verify failed")?;
                 let verify_ms = t1.elapsed().as_millis() as u64;
 
@@ -292,10 +292,18 @@ fn main() -> Result<()> {
 
                 let peak_rss = get_peak_rss();
 
+                // RISC Zero reports segments, not a single cycle count.
+                // Sum segment cycles for the total.
+                let total_cycles: u64 = session
+                    .segments
+                    .iter()
+                    .map(|s| s.cycles)
+                    .sum();
+
                 rows.push(Row {
                     size_label: label.to_string(),
                     size_bytes: data.len(),
-                    cycles: session.stats.total_cyclotors,
+                    cycles: total_cycles,
                     prove_ms,
                     verify_native_ms: verify_ms,
                     proof_bytes,
@@ -304,7 +312,7 @@ fn main() -> Result<()> {
 
                 println!(
                     "{}: {} cycles, prove {} ms, verify {} ms, proof {} bytes",
-                    label, session.stats.total_cyclotors, prove_ms, verify_ms, proof_bytes
+                    label, total_cycles, prove_ms, verify_ms, proof_bytes
                 );
             }
 

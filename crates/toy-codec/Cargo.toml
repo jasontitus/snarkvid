@@ -1,0 +1,18 @@
+[package]
+name = "snarkvid-toy-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# no_std so the same code runs natively (toy-encode, tests) and inside
+# the zkVM guest (milestone 2's prover).
+#
+# The "std" feature enables std-only helpers (e.g. Error impls for tests).
+# The guest compiles without it.
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]

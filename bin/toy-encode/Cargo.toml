@@ -1,16 +1,15 @@
 [package]
-name = "snarkvid-spike-bench-driver"
-version = "0.0.0"
+name = "toy-encode"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "bench-driver"
+name = "toy-encode"
 path = "src/main.rs"
 
 [dependencies]
+snarkvid-toy-codec = { path = "../../crates/toy-codec" }
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chrono = "0.4"
+anyhow = "1"
