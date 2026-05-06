@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [build-dependencies]
-# risc0-build = { version = "1.2" }
+risc0-build = { version = "1.2" }
 
 [features]
 default = []

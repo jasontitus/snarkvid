@@ -3,10 +3,15 @@ name = "snarkvid-spike-risc0-guest"
 version = "0.0.0"
 edition = "2021"
 
+# Guest is built with the riscv32im-risc0-zkvm-elf target via methods/build.rs.
+# Mark it as its own workspace root so cargo metadata doesn't merge it into
+# the host workspace at ../../Cargo.toml.
+[workspace]
+
 [[bin]]
 name = "sha256-preimage"
 path = "src/main.rs"
 
 [dependencies]
-# risc0-zkvm = { version = "1.2", default-features = false, features = ["std"] }
+risc0-zkvm = { version = "1.2", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false }

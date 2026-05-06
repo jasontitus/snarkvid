@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 #[cfg(feature = "risc0")]
 use clap::{Parser, Subcommand};
 #[cfg(feature = "risc0")]
-use risc0_zkvm::{default_prover, ExecutorEnv, Receipt, VerifierContext};
+use risc0_zkvm::{default_executor, default_prover, ExecutorEnv, Receipt};
 #[cfg(feature = "risc0")]
 use serde::Serialize;
 #[cfg(feature = "risc0")]
@@ -167,17 +167,19 @@ fn main() -> Result<()> {
                     .context("failed to write commitment")?;
             }
 
-            let env = ExecutorEnv::builder()
-                .write(&min_size)
-                .write(&data)
-                .build()
-                .context("failed to build executor env")?;
+            let env = {
+                let mut b = ExecutorEnv::builder();
+                b.write(&min_size).context("write min_size")?;
+                b.write(&data).context("write data")?;
+                b.build().context("failed to build executor env")?
+            };
 
             let prover = default_prover();
             let t0 = Instant::now();
             let receipt = prover
                 .prove(env, SHA256_PREIMAGE_ELF)
-                .context("prove failed")?;
+                .context("prove failed")?
+                .receipt;
             let prove_ms = t0.elapsed().as_millis() as u64;
 
             // Verify the receipt
@@ -241,6 +243,7 @@ fn main() -> Result<()> {
             let sizes = [("1k", 1024), ("1m", 1_048_576), ("10m", 10_485_760)];
             let mut rows = Vec::new();
             let prover = default_prover();
+            let executor = default_executor();
 
             for (label, _size) in sizes {
                 let fixture = fixture_dir.join(format!("fixture-{}.bin", label));
@@ -253,29 +256,32 @@ fn main() -> Result<()> {
                 let min_size = data.len() as u32;
 
                 // Build env for execution (to count cycles)
-                let exec_env = ExecutorEnv::builder()
-                    .write(&min_size)
-                    .write(&data)
-                    .build()
-                    .context("failed to build executor env")?;
+                let exec_env = {
+                    let mut b = ExecutorEnv::builder();
+                    b.write(&min_size).context("write min_size")?;
+                    b.write(&data).context("write data")?;
+                    b.build().context("failed to build executor env")?
+                };
 
                 // Execute to get cycle count
-                let session = prover
+                let session = executor
                     .execute(exec_env, SHA256_PREIMAGE_ELF)
                     .context("execute failed")?;
 
                 // Build a fresh env for proving (env is consumed by execute)
-                let prove_env = ExecutorEnv::builder()
-                    .write(&min_size)
-                    .write(&data)
-                    .build()
-                    .context("failed to build prover env")?;
+                let prove_env = {
+                    let mut b = ExecutorEnv::builder();
+                    b.write(&min_size).context("write min_size")?;
+                    b.write(&data).context("write data")?;
+                    b.build().context("failed to build prover env")?
+                };
 
                 // Prove
                 let t0 = Instant::now();
                 let receipt = prover
                     .prove(prove_env, SHA256_PREIMAGE_ELF)
-                    .context("prove failed")?;
+                    .context("prove failed")?
+                    .receipt;
                 let prove_ms = t0.elapsed().as_millis() as u64;
 
                 // Verify
@@ -297,7 +303,7 @@ fn main() -> Result<()> {
                 let total_cycles: u64 = session
                     .segments
                     .iter()
-                    .map(|s| s.cycles)
+                    .map(|s| s.cycles as u64)
                     .sum();
 
                 rows.push(Row {

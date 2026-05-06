@@ -4,6 +4,10 @@
 # Gracefully skips RISC Zero if it failed to build.
 set -euo pipefail
 
+# Use rustup shims so `+succinct` / `+risc0` toolchain selection works.
+# ~/.sp1/bin is where sp1up installs cargo-prove.
+export PATH="$HOME/.cargo/bin:$HOME/.sp1/bin:$PATH"
+
 cd "$(dirname "$0")/.."
 
 FIXTURES="spike/common/bench-fixtures"

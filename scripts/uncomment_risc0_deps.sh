@@ -13,7 +13,7 @@ FILES=(
 
 for f in "${FILES[@]}"; do
     echo "Uncommenting risc0 deps in $f"
-    sed -i '' 's/^# \(risc0-zkvm\|risc0-build\|bincode\|snarkvid-spike-risc0\)/\1/' "$f"
+    sed -i '' -E 's/^# (risc0-zkvm|risc0-build|bincode|snarkvid-spike-risc0)/\1/' "$f"
 done
 
 echo ""
