@@ -11,8 +11,8 @@ Both provers use a single GPU; multi-GPU buys you nothing here.
 
 | Need | Recommended | Notes |
 |---|---|---|
-| 1 KB + 1 MB head-to-head only | `gpu_1x_a10` (24 GB) | Cheapest, ~$0.75/hr |
-| 10 MB row, comfortable | `gpu_1x_a100` (40/80 GB) | ~$1.30/hr; 80 GB variant safer for 10 MB |
+| Full head-to-head incl. 10 MB | `gpu_1x_a10` (24 GB) | Measured ~8 GB peak GPU mem on 10 MB for either system; cheapest at ~$0.75/hr. Run SP1 and RISC Zero as separate invocations (see Troubleshooting). |
+| Faster wall-clock on 10 MB | `gpu_1x_a100` (40/80 GB) | ~$1.30/hr; ~3× faster prove than A10 in published bench numbers |
 | Fastest, if available | `gpu_1x_h100` | Best wall-clock; check on-demand availability |
 
 Lambda images come with Ubuntu 22.04, NVIDIA drivers, and CUDA preinstalled
@@ -46,7 +46,7 @@ of minutes.
 
 | Script | What it does |
 |---|---|
-| `scripts/setup_linux_cuda.sh` | Verifies GPU + nvcc; apt-installs build deps; rustup; runs `setup_sp1.sh`, `setup_risc0.sh`, `uncomment_risc0_deps.sh` |
+| `scripts/setup_linux_cuda.sh` | Verifies GPU + nvcc; apt-installs build deps (incl. `protobuf-compiler`); rustup; runs `setup_sp1.sh`, `setup_risc0.sh`, `uncomment_risc0_deps.sh` |
 | `scripts/bench_cuda.sh` | Builds SP1 with `--features cuda`, RISC Zero with `--features risc0,cuda`; runs all three fixtures with `SP1_PROVER=cuda` |
 
 The underlying `setup_sp1.sh` / `setup_risc0.sh` / `uncomment_risc0_deps.sh`
@@ -57,12 +57,22 @@ are shared with the macOS path; they detect the platform.
 - **SP1 6.1**: `sp1-sdk` has a `cuda` feature that pulls in `sp1-cuda`. The
   bench host calls `ProverClient::from_env().await`, which picks the backend
   from the `SP1_PROVER` env var (`cpu` / `cuda` / `network` / `mock`).
-  `bench_cuda.sh` exports `SP1_PROVER=cuda`.
-- **RISC Zero 1.2**: `risc0-zkvm` has a `cuda` feature. On `x86_64`,
-  `risc0-r0vm`'s target dep already force-enables it (`features = ["prove",
-  "cuda"]`), which is why `cargo install cargo-risczero` requires `nvcc`
-  even if you didn't ask for GPU explicitly. With the feature on,
-  `default_prover()` selects the CUDA backend automatically.
+  `bench_cuda.sh` exports `SP1_PROVER=cuda`. SP1's CUDA path runs the prover
+  in an out-of-process `sp1-gpu-server`; that server holds GPU memory across
+  prove calls and only releases it when `sp1-script` exits.
+- **RISC Zero 3.x**: `risc0-zkvm` has a `cuda` feature; the host crate's
+  `Cargo.toml` declares `cuda = ["risc0-zkvm/cuda"]` so `cargo build
+  --features risc0,cuda` brings in the CUDA backend. `default_prover()`
+  picks it automatically. The toolchain is installed via **`rzup`** (RISC
+  Zero's installer; replaces the older `cargo install cargo-risczero` flow);
+  `setup_risc0.sh` does this for you.
+
+### Why protobuf-compiler is required
+
+SP1's `sp1-prover-types` crate has a `build.rs` that runs `prost-build` over
+`.proto` files and so needs `protoc` on `PATH`. `setup_linux_cuda.sh` apt-
+installs `protobuf-compiler`. Without it the SP1 build fails partway with
+`Could not find 'protoc'`.
 
 ## Troubleshooting
 
@@ -81,7 +91,7 @@ To make it permanent for new shells:
 echo 'export PATH="$HOME/.cargo/bin:$HOME/.sp1/bin:/usr/local/cuda/bin:$PATH"' >> ~/.bashrc
 ```
 
-### `error: linker `cc` failed` during cargo-risczero install
+### `error: linker `cc` failed` during the RISC Zero or SP1 build
 
 Usually means the CUDA libs aren't on the linker path. Check:
 
@@ -107,10 +117,32 @@ this. If you ran a different build, rebuild with:
 Check the host was built with `--features risc0,cuda`. The default
 `bench_all.sh` does **not** pass `cuda`; only `bench_cuda.sh` does.
 
-### Out-of-GPU-memory on 10 MB
+### Out-of-GPU-memory or "verify segment / proof is invalid"
 
-Pick the 80 GB A100 variant or H100. The 10 MB fixture pushes prover memory
-significantly; 24 GB A10 is not safe for 10 MB.
+Both of these have shown up when the bench script runs SP1 then RISC Zero
+back-to-back on a 24 GB GPU. SP1's `sp1-gpu-server` holds GPU memory after
+its bench finishes and is only torn down when `sp1-script` exits — which
+in `bench_cuda.sh` happens *after* the RISC Zero step. RISC Zero then
+contends for GPU memory, and depending on timing you'll see either an OOM
+panic in `risc0-zkp/src/hal/cuda.rs` or a misleading
+"verify segment / verification indicates proof is invalid" (a CUDA error
+that didn't propagate cleanly).
+
+Mitigation: run the two systems as separate invocations rather than letting
+the script chain them. After the SP1 bench writes its JSON, kill any
+lingering `sp1-gpu-server`, then run the RISC Zero step:
+
+```bash
+# After SP1 completes
+pkill -9 -f sp1-gpu-server || true
+spike/risc0/target/release/risc0-host bench \
+    --fixture-dir spike/common/bench-fixtures \
+    --out spike/bench/results/risc0.json
+```
+
+A 24 GB A10 *is* sufficient for 10 MB on either system in isolation
+(measured: ~8 GB GPU at peak for either). It only fails when both systems
+fight for the same GPU.
 
 ## Comparing CUDA numbers to the Mac numbers
 

@@ -39,7 +39,8 @@ if command -v apt-get >/dev/null 2>&1; then
     echo "Installing build deps via apt..."
     sudo apt-get update -qq
     sudo apt-get install -y --no-install-recommends \
-        build-essential pkg-config libssl-dev curl git ca-certificates clang
+        build-essential pkg-config libssl-dev curl git ca-certificates clang \
+        protobuf-compiler
 fi
 
 # ----- Rust (rustup) ---------------------------------------------------------
