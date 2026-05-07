@@ -12,7 +12,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sp1_sdk::prelude::*;
 use sp1_sdk::ProverClient;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// The ELF we want to execute inside the zkVM.
@@ -211,7 +212,17 @@ async fn main() -> Result<()> {
             let pk = client.setup(ELF).await.context("setup failed")?;
 
             let sizes = [("1k", 1024), ("1m", 1_048_576), ("10m", 10_485_760)];
-            let mut rows = Vec::new();
+
+            // Re-serialize this after every fixture so a crash mid-run still
+            // leaves the completed rows durable on disk.
+            let mut partial = BenchResult {
+                system: "sp1".to_string(),
+                toolchain: format!("sp1-{}", env!("CARGO_PKG_VERSION")),
+                gpu: None,
+                verifier_wasm_gz_bytes: None,
+                verify_browser_ms: None,
+                rows: Vec::new(),
+            };
 
             for (label, _size) in sizes {
                 let fixture = fixture_dir.join(format!("fixture-{}.bin", label));
@@ -263,7 +274,7 @@ async fn main() -> Result<()> {
                 // Peak RSS (approximate from /proc/self/status on Linux)
                 let peak_rss = get_peak_rss();
 
-                rows.push(Row {
+                partial.rows.push(Row {
                     size_label: label.to_string(),
                     size_bytes: data.len(),
                     cycles: report.total_instruction_count(),
@@ -277,25 +288,22 @@ async fn main() -> Result<()> {
                     "{}: {} cycles, prove {} ms, verify {} ms, proof {} bytes",
                     label, report.total_instruction_count(), prove_ms, verify_ms, proof_bytes
                 );
+                let _ = std::io::stdout().flush();
+
+                // Persist the partial result after every fixture so a later
+                // crash never erases earlier rows.
+                if let Some(path) = out.as_ref() {
+                    write_partial(path, &partial)
+                        .with_context(|| format!("write partial bench results to {}", path.display()))?;
+                }
             }
 
-            let result = BenchResult {
-                system: "sp1".to_string(),
-                toolchain: format!("sp1-{}", env!("CARGO_PKG_VERSION")),
-                gpu: None, // GPU not available on this machine
-                verifier_wasm_gz_bytes: None,
-                verify_browser_ms: None,
-                rows,
-            };
-
-            let json = serde_json::to_string_pretty(&result)?;
-
-            if let Some(path) = out {
-                std::fs::write(&path, &json).context("failed to write bench JSON")?;
+            if let Some(path) = out.as_ref() {
                 println!("wrote {}", path.display());
             } else {
-                println!("{}", json);
+                println!("{}", serde_json::to_string_pretty(&partial)?);
             }
+            let _ = std::io::stdout().flush();
         }
     }
 
@@ -317,4 +325,21 @@ fn get_peak_rss() -> usize {
         }
     }
     0
+}
+
+/// Atomically write `result` as JSON to `path`. Writes to `<path>.tmp`, fsyncs,
+/// then renames into place — so a crash mid-run never leaves a half-file, and
+/// the latest fully-completed row is always durable on disk.
+fn write_partial(path: &Path, result: &BenchResult) -> Result<()> {
+    let json = serde_json::to_string_pretty(result)?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
 }
