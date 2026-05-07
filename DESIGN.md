@@ -220,6 +220,69 @@ The 32 parallel workers run on independent GPU instances (e.g., AWS g5.xlarge or
 
 The recursion step is the key to making this tractable. Without it, you'd ship 28,800 individual proofs (~70 MB total). With it, you ship one constant-size proof. The recursion prover is itself a small circuit that verifies a single child proof and accumulates state — it takes seconds to run and negligible memory.
 
+## 9.2 Amortization: same circuit, many inputs
+
+Snarkvid proves one fixed program (the H.264 decoder) against many different
+inputs (chunks, frames, videos). The "same logic again and again" property
+gives real engineering leverage at every layer; we list it here so design
+choices in M3+ are made with the leverage in mind.
+
+### Free wins (one-time setup costs amortize)
+
+The verifying key (SP1) / image ID (RISC Zero), the proving key, the lookup
+tables for the RISC-V instruction set, the recursion verifier circuit, and
+the Groth16 wrapper trusted setup are **all computed once per program version
+and reused for every input**. SP1's `client.setup(ELF)` is non-trivial; we
+pay it once and pickle the proving key. The verifier on the receiving end
+stores one constant per program version.
+
+### Medium wins (architecture-level)
+
+- **Reusable frame-aggregation circuit.** The N-frame aggregator is the same
+  shape every video; build it once and recurse with it for every input.
+- **Embarrassingly parallel proving.** Per-frame (or per-tile) proofs shard
+  across many GPUs; the orchestration tooling is reusable across inputs.
+- **Content-addressed proof caching.** If videos share content (intros,
+  templated ads, repeated logos), proofs of identical chunks can be cached
+  by frame hash. Pays off for templated content; doesn't help raw originals.
+
+### Big wins (worth real engineering investment)
+
+**Custom precompiles for the hot inner loops.** Both SP1 and RISC Zero let
+us replace specific RISC-V code paths with hand-built circuits. For SHA-256
+the published speedup is ~50×. The H.264 hot loops — IDCT, CABAC entropy
+decode (out of M3 scope but in for any High profile work), motion
+compensation, deblocking — are exactly the kind of math-heavy, structurally-
+repetitive operations that benefit most. Three to four good precompiles
+could plausibly knock 10–50× off the cycle count, and we write them once
+for the codec's lifetime. This is the single highest-leverage engineering
+investment after picking the zkVM.
+
+### The frontier (genuinely novel)
+
+- **Folding schemes** (Nova, ProtoStar, HyperNova) are *built* for "apply
+  the same step function N times to changing inputs." That is literally the
+  H.264 inner loop applied per macroblock or per frame. The prover does
+  ~O(1) work per step after a constant setup, and the result collapses to
+  one final SNARK. This is the architecturally-correct match for
+  snarkvid's workload, and a serious v2 likely targets it. Tradeoff:
+  tooling is less mature than SP1/RISC0 today.
+- **Newer zkVMs with aggressive lookups** (Jolt, Ceno, Lasso) — same
+  amortization story, much cheaper for repetitive structured workloads.
+  Worth tracking but not yet production-ready as of M1.
+
+### Implications for M3+
+
+- M3 (single I-frame in-circuit) should from day one assume that the
+  encoder/decoder will eventually be reached for via precompiles; build the
+  Rust decoder so the hot kernels (IDCT, intra prediction, CAVLC table
+  lookup) are isolated, mockable, and replaceable.
+- M4 (P-frames + audio + aggregation) is where the recursion-circuit
+  amortization actually lands; the per-frame aggregator gets built once
+  and reused for every video.
+- A v2-track investigation of folding schemes is a credible bet for cutting
+  prove cost by another order of magnitude.
+
 ## 10. Components
 
 ### 10.1 Original signing format
