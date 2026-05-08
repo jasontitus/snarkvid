@@ -439,6 +439,10 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ed25519-dalek",
+ "sha2",
+ "snarkvid-comparator",
+ "snarkvid-manifest",
  "snarkvid-toy-codec",
 ]
 

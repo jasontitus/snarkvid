@@ -94,6 +94,7 @@ pub fn check_psnr_threshold(
 // ---------------------------------------------------------------------------
 
 /// Result of a full-frame PSNR comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FramePsnrResult {
     pub psnr_y_scaled: i64,
     pub psnr_u_scaled: i64,
