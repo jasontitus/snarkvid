@@ -429,6 +429,328 @@ fn pred_horizontal_up(n: &Neighbors4x4) -> Result<[u8; 16], DecodeError> {
     Ok(out)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Intra_16×16 luma prediction (spec §8.3.2)
+//
+// One MB-sized prediction; the encoder picks one of 4 modes for the
+// whole 16×16 luma block. Neighbor samples: 16 across the top, 16
+// down the left, and the top-left corner.
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intra16x16Mode {
+    Vertical,
+    Horizontal,
+    Dc,
+    Plane,
+}
+
+impl Intra16x16Mode {
+    pub fn from_index(idx: u8) -> Result<Self, DecodeError> {
+        match idx {
+            0 => Ok(Self::Vertical),
+            1 => Ok(Self::Horizontal),
+            2 => Ok(Self::Dc),
+            3 => Ok(Self::Plane),
+            _ => Err(DecodeError::OutOfScope("Intra16x16 mode out of range")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Neighbors16x16 {
+    pub top_left: Option<u8>,
+    pub top: Option<[u8; 16]>,
+    pub left: Option<[u8; 16]>,
+}
+
+impl Neighbors16x16 {
+    pub const NONE: Self = Self { top_left: None, top: None, left: None };
+    pub fn all(top: [u8; 16], left: [u8; 16], top_left: u8) -> Self {
+        Self { top: Some(top), left: Some(left), top_left: Some(top_left) }
+    }
+}
+
+/// Return the 16×16 predicted block (256 u8 samples in raster order).
+pub fn predict_16x16(mode: Intra16x16Mode, n: &Neighbors16x16) -> Result<[u8; 256], DecodeError> {
+    match mode {
+        Intra16x16Mode::Vertical   => pred16_vertical(n),
+        Intra16x16Mode::Horizontal => pred16_horizontal(n),
+        Intra16x16Mode::Dc         => pred16_dc(n),
+        Intra16x16Mode::Plane      => pred16_plane(n),
+    }
+}
+
+fn pred16_vertical(n: &Neighbors16x16) -> Result<[u8; 256], DecodeError> {
+    let t = n.top.ok_or_else(|| err_neighbor_missing("16x16 vertical"))?;
+    let mut out = [0u8; 256];
+    for y in 0..16 {
+        for x in 0..16 {
+            out[y * 16 + x] = t[x];
+        }
+    }
+    Ok(out)
+}
+
+fn pred16_horizontal(n: &Neighbors16x16) -> Result<[u8; 256], DecodeError> {
+    let l = n.left.ok_or_else(|| err_neighbor_missing("16x16 horizontal"))?;
+    let mut out = [0u8; 256];
+    for y in 0..16 {
+        for x in 0..16 {
+            out[y * 16 + x] = l[y];
+        }
+    }
+    Ok(out)
+}
+
+fn pred16_dc(n: &Neighbors16x16) -> Result<[u8; 256], DecodeError> {
+    let dc: u32 = match (n.top, n.left) {
+        (Some(t), Some(l)) => {
+            let s: u32 = t.iter().map(|&x| x as u32).sum::<u32>()
+                       + l.iter().map(|&x| x as u32).sum::<u32>();
+            (s + 16) >> 5  // 32 samples → +16 round, >>5
+        }
+        (Some(t), None) => {
+            let s: u32 = t.iter().map(|&x| x as u32).sum();
+            (s + 8) >> 4
+        }
+        (None, Some(l)) => {
+            let s: u32 = l.iter().map(|&x| x as u32).sum();
+            (s + 8) >> 4
+        }
+        (None, None) => 128,
+    };
+    Ok([dc as u8; 256])
+}
+
+/// Plane prediction — linear regression on the neighbor samples.
+/// Spec §8.3.2.4. Requires top, left, and top-left all available.
+///
+///   H = Σ_{i=0..7} (i+1) * (P[8+i, -1] - P[6-i, -1])
+///   V = Σ_{j=0..7} (j+1) * (P[-1, 8+j] - P[-1, 6-j])
+///   b = (5*H + 32) >> 6
+///   c = (5*V + 32) >> 6
+///   a = 16 * (P[-1, 15] + P[15, -1])
+///   pred[x, y] = clamp(0..255, (a + b*(x-7) + c*(y-7) + 16) >> 5)
+///
+/// where P[-1, -1] is `top_left`, P[i, -1] is `top[i]` for i ∈ 0..16,
+/// and P[-1, j] is `left[j]` for j ∈ 0..16. The H sum's i=7 term reads
+/// `top[15] - top[-1]`, i.e. uses the top-left corner.
+fn pred16_plane(n: &Neighbors16x16) -> Result<[u8; 256], DecodeError> {
+    let t = n.top.ok_or_else(|| err_neighbor_missing("16x16 plane: top"))?;
+    let l = n.left.ok_or_else(|| err_neighbor_missing("16x16 plane: left"))?;
+    let tl = n.top_left.ok_or_else(|| err_neighbor_missing("16x16 plane: top-left"))?;
+
+    // Helper: top sample at logical index, where -1 is the corner.
+    let top_at = |i: isize| -> i32 {
+        if i == -1 { tl as i32 } else { t[i as usize] as i32 }
+    };
+    let left_at = |j: isize| -> i32 {
+        if j == -1 { tl as i32 } else { l[j as usize] as i32 }
+    };
+
+    let mut h: i32 = 0;
+    for i in 0..8i32 {
+        h += (i + 1) * (top_at((8 + i) as isize) - top_at((6 - i) as isize));
+    }
+    let mut v: i32 = 0;
+    for j in 0..8i32 {
+        v += (j + 1) * (left_at((8 + j) as isize) - left_at((6 - j) as isize));
+    }
+    let b = (5 * h + 32) >> 6;
+    let c = (5 * v + 32) >> 6;
+    let a = 16 * (l[15] as i32 + t[15] as i32);
+
+    let mut out = [0u8; 256];
+    for y in 0..16i32 {
+        for x in 0..16i32 {
+            let pred = (a + b * (x - 7) + c * (y - 7) + 16) >> 5;
+            out[(y * 16 + x) as usize] = pred.clamp(0, 255) as u8;
+        }
+    }
+    Ok(out)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Chroma intra prediction for 4:2:0 (spec §8.3.3)
+//
+// Each chroma plane (Cb, Cr) has one 8×8 block per macroblock. Same
+// 4 modes as Intra_16×16, just on a smaller block:
+//   0 DC (with the 4-sub-block carve-out)
+//   1 Horizontal
+//   2 Vertical
+//   3 Plane
+// ─────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntraChromaMode {
+    Dc,
+    Horizontal,
+    Vertical,
+    Plane,
+}
+
+impl IntraChromaMode {
+    pub fn from_index(idx: u8) -> Result<Self, DecodeError> {
+        match idx {
+            0 => Ok(Self::Dc),
+            1 => Ok(Self::Horizontal),
+            2 => Ok(Self::Vertical),
+            3 => Ok(Self::Plane),
+            _ => Err(DecodeError::OutOfScope("ChromaIntra mode out of range")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NeighborsChroma8x8 {
+    pub top_left: Option<u8>,
+    pub top: Option<[u8; 8]>,
+    pub left: Option<[u8; 8]>,
+}
+
+impl NeighborsChroma8x8 {
+    pub const NONE: Self = Self { top_left: None, top: None, left: None };
+    pub fn all(top: [u8; 8], left: [u8; 8], top_left: u8) -> Self {
+        Self { top: Some(top), left: Some(left), top_left: Some(top_left) }
+    }
+}
+
+/// Return the 8×8 predicted chroma block (64 u8 samples in raster order).
+pub fn predict_chroma_8x8(mode: IntraChromaMode, n: &NeighborsChroma8x8) -> Result<[u8; 64], DecodeError> {
+    match mode {
+        IntraChromaMode::Vertical   => predc_vertical(n),
+        IntraChromaMode::Horizontal => predc_horizontal(n),
+        IntraChromaMode::Dc         => predc_dc(n),
+        IntraChromaMode::Plane      => predc_plane(n),
+    }
+}
+
+fn predc_vertical(n: &NeighborsChroma8x8) -> Result<[u8; 64], DecodeError> {
+    let t = n.top.ok_or_else(|| err_neighbor_missing("chroma 8x8 vertical"))?;
+    let mut out = [0u8; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            out[y * 8 + x] = t[x];
+        }
+    }
+    Ok(out)
+}
+
+fn predc_horizontal(n: &NeighborsChroma8x8) -> Result<[u8; 64], DecodeError> {
+    let l = n.left.ok_or_else(|| err_neighbor_missing("chroma 8x8 horizontal"))?;
+    let mut out = [0u8; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            out[y * 8 + x] = l[y];
+        }
+    }
+    Ok(out)
+}
+
+/// DC mode for chroma — the spec carves the 8×8 block into four
+/// 4×4 sub-blocks and applies a different averaging rule per
+/// sub-block, using only the segment of top/left that's adjacent
+/// to that sub-block. Per §8.3.3.2.
+fn predc_dc(n: &NeighborsChroma8x8) -> Result<[u8; 64], DecodeError> {
+    // Compute the four sub-block DCs.
+    let dc_block = |sb_x: usize, sb_y: usize, t: Option<&[u8; 8]>, l: Option<&[u8; 8]>| -> u32 {
+        // Sub-block at (sb_x, sb_y) reads top samples [sb_x*4..sb_x*4+4]
+        // and left samples [sb_y*4..sb_y*4+4]. Spec rules:
+        // - block 0 (top-left): both → 8-sample avg, top-only → 4, left-only → 4, neither → 128
+        // - block 1 (top-right): top → 4-sample top avg, else if left → top-block-0 left avg, else 128
+        // - block 2 (bottom-left): left → 4-sample left avg, else if top → top-block-0 top avg, else 128
+        // - block 3 (bottom-right): both → 8-sample avg of top[4..8]+left[4..8], else fallback
+        let sum_seg = |arr: Option<&[u8; 8]>, start: usize| -> u32 {
+            arr.map(|a| a[start..start+4].iter().map(|&x| x as u32).sum()).unwrap_or(0)
+        };
+        match (sb_x, sb_y) {
+            (0, 0) => match (t, l) {
+                (Some(_), Some(_)) => (sum_seg(t, 0) + sum_seg(l, 0) + 4) >> 3,
+                (Some(_), None)    => (sum_seg(t, 0) + 2) >> 2,
+                (None, Some(_))    => (sum_seg(l, 0) + 2) >> 2,
+                (None, None)       => 128,
+            },
+            (1, 0) => match (t, l) {
+                (Some(_), _)    => (sum_seg(t, 4) + 2) >> 2,
+                (None, Some(_)) => (sum_seg(l, 0) + 2) >> 2,
+                (None, None)    => 128,
+            },
+            (0, 1) => match (t, l) {
+                (_, Some(_))       => (sum_seg(l, 4) + 2) >> 2,
+                (Some(_), None)    => (sum_seg(t, 0) + 2) >> 2,
+                (None, None)       => 128,
+            },
+            (1, 1) => match (t, l) {
+                (Some(_), Some(_)) => (sum_seg(t, 4) + sum_seg(l, 4) + 4) >> 3,
+                (Some(_), None)    => (sum_seg(t, 4) + 2) >> 2,
+                (None, Some(_))    => (sum_seg(l, 4) + 2) >> 2,
+                (None, None)       => 128,
+            },
+            _ => unreachable!(),
+        }
+    };
+
+    let t_ref = n.top.as_ref();
+    let l_ref = n.left.as_ref();
+    let dc00 = dc_block(0, 0, t_ref, l_ref) as u8;
+    let dc10 = dc_block(1, 0, t_ref, l_ref) as u8;
+    let dc01 = dc_block(0, 1, t_ref, l_ref) as u8;
+    let dc11 = dc_block(1, 1, t_ref, l_ref) as u8;
+
+    let mut out = [0u8; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            let sb_x = x / 4;
+            let sb_y = y / 4;
+            let v = match (sb_x, sb_y) {
+                (0, 0) => dc00, (1, 0) => dc10,
+                (0, 1) => dc01, (1, 1) => dc11,
+                _ => unreachable!(),
+            };
+            out[y * 8 + x] = v;
+        }
+    }
+    Ok(out)
+}
+
+/// Chroma plane mode — same shape as luma 16×16 plane but on an 8×8
+/// block. Spec §8.3.3.4. Coefficients differ: H/V sums run over 4
+/// (not 8); the b/c constants are 34 with >>6 (instead of 5 with >>6).
+fn predc_plane(n: &NeighborsChroma8x8) -> Result<[u8; 64], DecodeError> {
+    let t = n.top.ok_or_else(|| err_neighbor_missing("chroma plane: top"))?;
+    let l = n.left.ok_or_else(|| err_neighbor_missing("chroma plane: left"))?;
+    let tl = n.top_left.ok_or_else(|| err_neighbor_missing("chroma plane: top-left"))?;
+
+    let top_at = |i: isize| -> i32 {
+        if i == -1 { tl as i32 } else { t[i as usize] as i32 }
+    };
+    let left_at = |j: isize| -> i32 {
+        if j == -1 { tl as i32 } else { l[j as usize] as i32 }
+    };
+
+    let mut h: i32 = 0;
+    for i in 0..4i32 {
+        h += (i + 1) * (top_at((4 + i) as isize) - top_at((2 - i) as isize));
+    }
+    let mut v: i32 = 0;
+    for j in 0..4i32 {
+        v += (j + 1) * (left_at((4 + j) as isize) - left_at((2 - j) as isize));
+    }
+    let b = (34 * h + 32) >> 6;
+    let c = (34 * v + 32) >> 6;
+    let a = 16 * (l[7] as i32 + t[7] as i32);
+
+    let mut out = [0u8; 64];
+    for y in 0..8i32 {
+        for x in 0..8i32 {
+            let pred = (a + b * (x - 3) + c * (y - 3) + 16) >> 5;
+            out[(y * 8 + x) as usize] = pred.clamp(0, 255) as u8;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +899,179 @@ mod tests {
         };
         let out = predict_4x4(Intra4x4Mode::DiagonalDownLeft, &n).unwrap();
         assert_eq!(out[15], 26, "pred[3,3] should be (tr[2]+3*tr[3]+2)>>2");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Intra_16×16 tests
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn intra16_vertical_copies_top_row_down() {
+        let mut top = [0u8; 16];
+        for i in 0..16 { top[i] = (i * 10) as u8; }
+        let n = Neighbors16x16 { top: Some(top), left: None, top_left: None };
+        let out = predict_16x16(Intra16x16Mode::Vertical, &n).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(out[y * 16 + x], top[x],
+                    "row {} col {} should match top[{}]", y, x, x);
+            }
+        }
+    }
+
+    #[test]
+    fn intra16_horizontal_copies_left_column_right() {
+        let mut left = [0u8; 16];
+        for j in 0..16 { left[j] = (j * 7) as u8; }
+        let n = Neighbors16x16 { top: None, left: Some(left), top_left: None };
+        let out = predict_16x16(Intra16x16Mode::Horizontal, &n).unwrap();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(out[y * 16 + x], left[y]);
+            }
+        }
+    }
+
+    #[test]
+    fn intra16_dc_constant_input_yields_constant_output() {
+        // top + left = 32 samples, all equal to c.
+        let c = 100u8;
+        let n = Neighbors16x16::all([c; 16], [c; 16], c);
+        let out = predict_16x16(Intra16x16Mode::Dc, &n).unwrap();
+        // (32*100 + 16) >> 5 = 3216/32 = 100.5 → 100.
+        assert!(out.iter().all(|&v| v == 100));
+    }
+
+    #[test]
+    fn intra16_dc_neither_neighbor_falls_back_to_128() {
+        let n = Neighbors16x16::NONE;
+        let out = predict_16x16(Intra16x16Mode::Dc, &n).unwrap();
+        assert!(out.iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn intra16_plane_constant_input_yields_constant_output() {
+        // H = V = 0; b = c = 0; a = 32*c; pred = (32c + 16) >> 5 = c (truncates).
+        let c = 75u8;
+        let n = Neighbors16x16::all([c; 16], [c; 16], c);
+        let out = predict_16x16(Intra16x16Mode::Plane, &n).unwrap();
+        assert!(out.iter().all(|&v| v == c),
+            "plane on constant should be constant; got first 4: {:?}", &out[..4]);
+    }
+
+    #[test]
+    fn intra16_plane_with_horizontal_gradient() {
+        // Top is a linear ramp 0, 16, 32, ..., 240; left + tl all 128.
+        // The plane fit should approximate a horizontal linear gradient.
+        let top: [u8; 16] = core::array::from_fn(|i| (i * 16).min(255) as u8);
+        let n = Neighbors16x16::all(top, [128; 16], 128);
+        let out = predict_16x16(Intra16x16Mode::Plane, &n).unwrap();
+        // The leftmost column should be smaller than the rightmost.
+        let left_col_avg: u32 = (0..16).map(|y| out[y * 16] as u32).sum::<u32>() / 16;
+        let right_col_avg: u32 = (0..16).map(|y| out[y * 16 + 15] as u32).sum::<u32>() / 16;
+        assert!(right_col_avg > left_col_avg,
+            "plane with right-rising top should give right > left ({} vs {})",
+            right_col_avg, left_col_avg);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Chroma 8×8 tests
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn chroma_vertical_copies_top_row_down() {
+        let top = [10, 20, 30, 40, 50, 60, 70, 80u8];
+        let n = NeighborsChroma8x8 { top: Some(top), left: None, top_left: None };
+        let out = predict_chroma_8x8(IntraChromaMode::Vertical, &n).unwrap();
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(out[y * 8 + x], top[x]);
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_horizontal_copies_left_column_right() {
+        let left = [10, 20, 30, 40, 50, 60, 70, 80u8];
+        let n = NeighborsChroma8x8 { top: None, left: Some(left), top_left: None };
+        let out = predict_chroma_8x8(IntraChromaMode::Horizontal, &n).unwrap();
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(out[y * 8 + x], left[y]);
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_dc_constant_input_yields_constant_output() {
+        let c = 50u8;
+        let n = NeighborsChroma8x8::all([c; 8], [c; 8], c);
+        let out = predict_chroma_8x8(IntraChromaMode::Dc, &n).unwrap();
+        assert!(out.iter().all(|&v| v == c));
+    }
+
+    #[test]
+    fn chroma_dc_top_only_uses_top_segments() {
+        // top = [a, a, a, a, b, b, b, b], no left available.
+        // Sub-block (0,0): top-only → avg(a,a,a,a) = a
+        // Sub-block (1,0): top → avg(b,b,b,b) = b
+        // Sub-block (0,1): no left, top fallback → avg(top[0..4]) = a
+        // Sub-block (1,1): top-only → avg(b,b,b,b) = b
+        let n = NeighborsChroma8x8 {
+            top: Some([10, 10, 10, 10, 50, 50, 50, 50]),
+            left: None, top_left: None,
+        };
+        let out = predict_chroma_8x8(IntraChromaMode::Dc, &n).unwrap();
+        // Top-left sub-block (rows 0..3, cols 0..3) should be 10:
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(out[y * 8 + x], 10, "S00 at ({}, {})", x, y);
+            }
+        }
+        // Top-right (rows 0..3, cols 4..7) should be 50:
+        for y in 0..4 {
+            for x in 4..8 {
+                assert_eq!(out[y * 8 + x], 50, "S10 at ({}, {})", x, y);
+            }
+        }
+        // Bottom-left (rows 4..7, cols 0..3): per spec, no-left fallback
+        // uses top[0..4] = 10:
+        for y in 4..8 {
+            for x in 0..4 {
+                assert_eq!(out[y * 8 + x], 10, "S01 at ({}, {})", x, y);
+            }
+        }
+        // Bottom-right (rows 4..7, cols 4..7): top-only → top[4..8] = 50:
+        for y in 4..8 {
+            for x in 4..8 {
+                assert_eq!(out[y * 8 + x], 50, "S11 at ({}, {})", x, y);
+            }
+        }
+    }
+
+    #[test]
+    fn chroma_dc_no_neighbors_falls_back_to_128() {
+        let n = NeighborsChroma8x8::NONE;
+        let out = predict_chroma_8x8(IntraChromaMode::Dc, &n).unwrap();
+        assert!(out.iter().all(|&v| v == 128));
+    }
+
+    #[test]
+    fn chroma_plane_constant_input_yields_constant_output() {
+        // Same property as luma 16×16 plane: H = V = 0, a = 32c, pred = c.
+        let c = 60u8;
+        let n = NeighborsChroma8x8::all([c; 8], [c; 8], c);
+        let out = predict_chroma_8x8(IntraChromaMode::Plane, &n).unwrap();
+        assert!(out.iter().all(|&v| v == c));
+    }
+
+    #[test]
+    fn from_index_intra16_and_chroma_round_trip() {
+        for i in 0..=3u8 {
+            assert!(Intra16x16Mode::from_index(i).is_ok());
+            assert!(IntraChromaMode::from_index(i).is_ok());
+        }
+        assert!(Intra16x16Mode::from_index(4).is_err());
+        assert!(IntraChromaMode::from_index(4).is_err());
     }
 }
