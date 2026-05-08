@@ -23,7 +23,7 @@ publish = false
 [workspace.dependencies]
 # Shared deps across milestone-2 crates
 serde = { version = "1", default-features = false, features = ["derive"] }
-ed25519-dalek = "2"
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
 # Poseidon (circuit-friendly hash for Merkle): add when chosen
 # arkworks or Neptune

@@ -59,7 +59,6 @@ nothing to run yet. Tracking here so they don't get lost.
 | Jolt verify-from-proof | Tried; blocked. The `JoltProof<F, C, PCS, FS>` type isn't re-exported by `#[jolt::provable]`. Wiring `CanonicalDeserialize` requires importing `jolt-core`'s field/curve/PCS/transcript types and pinning Jolt's exact instantiation — tighter coupling than the spike warrants. | Doesn't block bench (prove already calls verify in-process). Re-evaluate if Jolt is picked at the M3 prover-pick gate. |
 | Sonobe verify-from-proof | Functional but slow — re-runs preprocessing every call instead of caching verifier params | Verify times reported by `cmd_verify` include preprocessing; bench numbers are unaffected (they don't re-preprocess). |
 | M2 prover & end-to-end statement | The full M2 statement (signed manifest + Merkle auth + decode_toy + PSNR comparator, all in one proof) isn't built yet | Each piece exists native; the prover/guest binary that composes them is the next M2 milestone. |
-| `crates/manifest` no_std purity | Crate carries `#![no_std]` but pulls `ed25519-dalek` with default features (which include `std`). Source compiles with no_std symbols only. | Doesn't block native use. M3 in-circuit guest will need `default-features = false, features = ["alloc"]` on the dalek dep. |
 
 ## Re-running individual phases
 
