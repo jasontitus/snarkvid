@@ -48,6 +48,10 @@ hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# arkworks via Jolt's [patch.crates-io] override below — we just need
+# the trait `CanonicalSerialize` in scope to try serializing JoltProof.
+ark-serialize = "0.5"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -7,6 +7,11 @@ edition = "2021"
 name = "sha256-preimage"
 path = "src/main.rs"
 
+[[bin]]
+name = "toy-decode"
+path = "src/bin/toy_decode.rs"
+
 [dependencies]
 sp1-zkvm = "6.1.0"
 sha2 = "0.10.8"
+snarkvid-toy-codec = { path = "../../../crates/toy-codec", default-features = false }

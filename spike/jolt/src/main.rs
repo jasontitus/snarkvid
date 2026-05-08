@@ -18,9 +18,64 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use tracing::field::{Field, Visit};
+use tracing::Subscriber;
+use tracing_subscriber::layer::{Context as LayerContext, Layer};
+use tracing_subscriber::registry::LookupSpan;
 
 use snarkvid_toy_codec::{decode_toy, BqBitstream, BqHeader};
+
+/// Global cycle counter populated by the CycleCapture tracing layer.
+/// Reset to 0 before each prove call; read after.
+static CAPTURED_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+fn reset_cycles() {
+    CAPTURED_CYCLES.store(0, Ordering::SeqCst);
+}
+
+fn read_cycles() -> u64 {
+    CAPTURED_CYCLES.load(Ordering::SeqCst)
+}
+
+/// `tracing` Layer that scrapes Jolt's "X total cycles" line out of the
+/// log stream. Jolt has no programmatic cycle accessor in May 2026; this
+/// gives the bench JSON an honest cycle count without parsing stderr.
+///
+/// The line we match looks like:
+///   "4106 raw RISC-V instructions + 48926 virtual instructions = 53032 total cycles"
+#[derive(Clone, Default)]
+struct CycleCapture;
+
+impl<S> Layer<S> for CycleCapture
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: LayerContext<'_, S>) {
+        struct MsgGrab;
+        impl Visit for MsgGrab {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    let s = format!("{:?}", value);
+                    if let Some(cycles) = parse_total_cycles(&s) {
+                        CAPTURED_CYCLES.store(cycles, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+        let mut g = MsgGrab;
+        event.record(&mut g);
+    }
+}
+
+fn parse_total_cycles(s: &str) -> Option<u64> {
+    // " ... = 53032 total cycles" — find " total cycles", walk back over digits.
+    let idx = s.find("total cycles")?;
+    let head = s[..idx].trim_end();
+    let last_token = head.rsplit(|c: char| !c.is_ascii_digit()).next()?;
+    last_token.parse::<u64>().ok()
+}
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum Workload {
@@ -154,7 +209,7 @@ fn run_sha256_prove(
     data: &[u8],
     min_size: u32,
     out_proof: Option<&Path>,
-) -> Result<(Vec<u8>, u64, u64, u64)> {
+) -> Result<(Vec<u8>, u64, u64, u64, usize)> {
     let mut program = guest::compile_sha2_preimage(TARGET_DIR);
 
     let shared_pp = guest::preprocess_shared_sha2_preimage(&mut program)
@@ -169,11 +224,12 @@ fn run_sha256_prove(
     let prove = guest::build_prover_sha2_preimage(program, prover_pp);
     let verify = guest::build_verifier_sha2_preimage(verifier_pp);
 
+    reset_cycles();
     let t = Instant::now();
     let (output, proof, program_io) = prove(min_size, data);
     let prove_ms = t.elapsed().as_millis() as u64;
+    let cycles = read_cycles();
 
-    // Sanity-check the output matches a native SHA-256.
     let expected_digest: [u8; 32] = Sha256::digest(data).into();
     anyhow::ensure!(
         output.0 == expected_digest && output.1 == min_size,
@@ -182,18 +238,31 @@ fn run_sha256_prove(
         output.0
     );
 
-    // Jolt's `JoltProof` type doesn't implement Clone or serde::Serialize
-    // in May 2026 — the underlying ark_serialize::CanonicalSerialize impl
-    // exists but isn't exposed in the public type. Until it's wired,
-    // verify consumes the proof and we record proof_bytes=0 in the JSON.
-    // The milestone report flags this as a known gap.
-    let _ = out_proof;
+    // ark_serialize via the optional helper. Returns None if JoltProof
+    // doesn't impl CanonicalSerialize on this Jolt revision; we fall
+    // back to proof_bytes=0 with a warning.
+    let proof_buf = serialize_jolt_proof(&proof);
+
     let t = Instant::now();
     let is_valid = verify(min_size, data, output, program_io.panic, proof);
     let verify_ms = t.elapsed().as_millis() as u64;
     anyhow::ensure!(is_valid, "verify returned false");
 
-    Ok((Vec::new(), prove_ms, verify_ms, 0))
+    if let (Some(p), Some(buf)) = (out_proof, proof_buf.as_ref()) {
+        std::fs::write(p, buf).context("write proof")?;
+    }
+    let buf = proof_buf.unwrap_or_default();
+    let len = buf.len();
+    Ok((buf, prove_ms, verify_ms, cycles, len))
+}
+
+/// Serialize a JoltProof via ark_serialize. Returns None if the type
+/// doesn't impl CanonicalSerialize on this Jolt revision; the caller
+/// records proof_bytes=0 and the milestone report flags it.
+fn serialize_jolt_proof<P: ark_serialize::CanonicalSerialize>(proof: &P) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    proof.serialize_compressed(&mut buf).ok()?;
+    Some(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +272,7 @@ fn run_sha256_prove(
 fn run_toy_decode_prove(
     yuv_bytes: &[u8],
     out_proof: Option<&Path>,
-) -> Result<(Vec<u8>, u64, u64, u64)> {
+) -> Result<(Vec<u8>, u64, u64, u64, usize)> {
     anyhow::ensure!(
         yuv_bytes.len() == 384,
         "toy-decode workload expects 384 bytes (16x16 4:2:0); got {}",
@@ -223,10 +292,11 @@ fn run_toy_decode_prove(
     let prove = guest_toy_decode::build_prover_toy_decode_one_block(program, prover_pp);
     let verify = guest_toy_decode::build_verifier_toy_decode_one_block(verifier_pp);
 
-    let _ = out_proof;
+    reset_cycles();
     let t = Instant::now();
     let (output, proof, program_io) = prove(yuv_bytes);
     let prove_ms = t.elapsed().as_millis() as u64;
+    let cycles = read_cycles();
 
     // Compute the same decode + digest natively for cross-check.
     let header = BqHeader {
@@ -258,12 +328,19 @@ fn run_toy_decode_prove(
         bytes_to_hex(&output)
     );
 
+    let proof_buf = serialize_jolt_proof(&proof);
+
     let t = Instant::now();
     let is_valid = verify(yuv_bytes, output, program_io.panic, proof);
     let verify_ms = t.elapsed().as_millis() as u64;
     anyhow::ensure!(is_valid, "verify returned false");
 
-    Ok((Vec::new(), prove_ms, verify_ms, 0))
+    if let (Some(p), Some(buf)) = (out_proof, proof_buf.as_ref()) {
+        std::fs::write(p, buf).context("write proof")?;
+    }
+    let buf = proof_buf.unwrap_or_default();
+    let len = buf.len();
+    Ok((buf, prove_ms, verify_ms, cycles, len))
 }
 
 // ---------------------------------------------------------------------------
@@ -284,20 +361,24 @@ fn cmd_prove(
             if let Some(p) = &commit_out {
                 std::fs::write(p, bytes_to_hex(&commitment))?;
             }
-            let (_buf, p, v, _c) = run_sha256_prove(&data, min_size, Some(&out))?;
+            let (_buf, p, v, c, plen) = run_sha256_prove(&data, min_size, Some(&out))?;
             println!(
-                "proved in {} ms, verified in {} ms, commitment={}",
+                "proved in {} ms ({} cycles), verified in {} ms, proof {} bytes, commitment={}",
                 p,
+                c,
                 v,
+                plen,
                 bytes_to_hex(&commitment)
             );
         }
         Workload::ToyDecode => {
-            // Pad / truncate to exactly 384 bytes
             let mut buf = data.clone();
             buf.resize(384, 0);
-            let (_b, p, v, _c) = run_toy_decode_prove(&buf, Some(&out))?;
-            println!("proved in {} ms, verified in {} ms", p, v);
+            let (_b, p, v, c, plen) = run_toy_decode_prove(&buf, Some(&out))?;
+            println!(
+                "proved in {} ms ({} cycles), verified in {} ms, proof {} bytes",
+                p, c, v, plen
+            );
         }
     }
     Ok(())
@@ -369,7 +450,7 @@ fn cmd_bench(workload: Workload, fixture_dir: PathBuf, out: Option<PathBuf>) -> 
                 let data = std::fs::read(&fixture)
                     .with_context(|| format!("read {}", fixture.display()))?;
                 let min_size = data.len() as u32;
-                let (buf, prove_ms, verify_ms, cycles) =
+                let (_buf, prove_ms, verify_ms, cycles, plen) =
                     run_sha256_prove(&data, min_size, None)?;
                 partial.rows.push(Row {
                     size_label: label.to_string(),
@@ -377,15 +458,16 @@ fn cmd_bench(workload: Workload, fixture_dir: PathBuf, out: Option<PathBuf>) -> 
                     cycles,
                     prove_ms,
                     verify_native_ms: verify_ms,
-                    proof_bytes: buf.len(),
+                    proof_bytes: plen,
                     peak_rss_bytes: get_peak_rss(),
                 });
                 println!(
-                    "{}: prove {} ms, verify {} ms, proof {} bytes",
+                    "{}: {} cycles, prove {} ms, verify {} ms, proof {} bytes",
                     label,
+                    cycles,
                     prove_ms,
                     verify_ms,
-                    buf.len()
+                    plen
                 );
                 let _ = std::io::stdout().flush();
                 if let Some(p) = out.as_ref() {
@@ -397,7 +479,7 @@ fn cmd_bench(workload: Workload, fixture_dir: PathBuf, out: Option<PathBuf>) -> 
             for (label, size) in toy_sizes {
                 // Synthetic fixture: a deterministic ramp 0..size.
                 let data: Vec<u8> = (0..size).map(|i| (i & 0xff) as u8).collect();
-                let (buf, prove_ms, verify_ms, cycles) =
+                let (_buf, prove_ms, verify_ms, cycles, plen) =
                     run_toy_decode_prove(&data, None)?;
                 partial.rows.push(Row {
                     size_label: label.to_string(),
@@ -405,15 +487,16 @@ fn cmd_bench(workload: Workload, fixture_dir: PathBuf, out: Option<PathBuf>) -> 
                     cycles,
                     prove_ms,
                     verify_native_ms: verify_ms,
-                    proof_bytes: buf.len(),
+                    proof_bytes: plen,
                     peak_rss_bytes: get_peak_rss(),
                 });
                 println!(
-                    "{}: prove {} ms, verify {} ms, proof {} bytes",
+                    "{}: {} cycles, prove {} ms, verify {} ms, proof {} bytes",
                     label,
+                    cycles,
                     prove_ms,
                     verify_ms,
-                    buf.len()
+                    plen
                 );
                 let _ = std::io::stdout().flush();
                 if let Some(p) = out.as_ref() {
@@ -426,11 +509,13 @@ fn cmd_bench(workload: Workload, fixture_dir: PathBuf, out: Option<PathBuf>) -> 
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    use tracing_subscriber::prelude::*;
+    let env = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(env)
+        .with(tracing_subscriber::fmt::layer())
+        .with(CycleCapture::default())
         .init();
     let cli = Cli::parse();
     match cli.command {

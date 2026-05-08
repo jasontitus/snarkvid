@@ -20,14 +20,17 @@
 
 use anyhow::{Context, Result};
 use ark_bn254::{Bn254, Fr, G1Projective as Projective};
+use ark_groth16::Groth16;
 use ark_grumpkin::Projective as Projective2;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use clap::{Parser, Subcommand, ValueEnum};
 use folding_schemes::commitment::{kzg::KZG, pedersen::Pedersen};
+use folding_schemes::folding::nova::decider_eth::Decider as DeciderEth;
 use folding_schemes::folding::nova::{Nova, PreprocessorParam};
+use folding_schemes::folding::traits::CommittedInstanceOps;
 use folding_schemes::frontend::FCircuit;
 use folding_schemes::transcript::poseidon::poseidon_canonical_config;
-use folding_schemes::FoldingScheme;
+use folding_schemes::{Decider as DeciderTrait, FoldingScheme};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::Write as IoWrite;
@@ -58,6 +61,28 @@ type NovaToy = Nova<
     KZG<'static, Bn254>,
     Pedersen<Projective2>,
     false,
+>;
+
+// DeciderEth wraps the IVC accumulator into a Groth16/BN254 proof
+// (~200 bytes, verifiable by any standard Groth16 verifier including
+// off-the-shelf WASM ones). This is the load-bearing browser-verify path.
+type DeciderSha = DeciderEth<
+    Projective,
+    Projective2,
+    Sha256FCircuit<Fr>,
+    KZG<'static, Bn254>,
+    Pedersen<Projective2>,
+    Groth16<Bn254>,
+    NovaSha,
+>;
+type DeciderToy = DeciderEth<
+    Projective,
+    Projective2,
+    ToyDecodeFCircuit<Fr>,
+    KZG<'static, Bn254>,
+    Pedersen<Projective2>,
+    Groth16<Bn254>,
+    NovaToy,
 >;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -113,6 +138,13 @@ enum Commands {
         out: Option<PathBuf>,
         #[arg(long, default_value_t = 1024)]
         max_steps: usize,
+        /// Run DeciderEth on top of the IVC accumulator to produce a
+        /// Groth16/BN254 proof (~200 bytes). This is the load-bearing
+        /// browser-verifier experiment. Decider proving + preprocessing
+        /// is heavy (single-shot Groth16 over a large constraint system)
+        /// so this is gated off by default.
+        #[arg(long, default_value_t = false)]
+        decider: bool,
     },
 }
 
@@ -213,10 +245,20 @@ fn sha_chain_native(initial: Fr, num_steps: usize) -> Fr {
     z
 }
 
-fn run_sha_chain(
-    num_steps: usize,
-    out_proof: Option<&Path>,
-) -> Result<(Vec<u8>, Fr, u64, u64)> {
+/// Output of a Nova IVC run that we may want to feed into the Decider.
+struct ShaIvcRun {
+    /// Folding scheme instance after `num_steps` proves; consumed by Decider.
+    nova: NovaSha,
+    nova_params: <NovaSha as FoldingScheme<Projective, Projective2, Sha256FCircuit<Fr>>>::ProverParam,
+    nova_vp: <NovaSha as FoldingScheme<Projective, Projective2, Sha256FCircuit<Fr>>>::VerifierParam,
+    f_circuit: Sha256FCircuit<Fr>,
+    final_z: Fr,
+    ivc_proof_bytes: Vec<u8>,
+    prove_ms: u64,
+    verify_ms: u64,
+}
+
+fn run_sha_chain_full(num_steps: usize) -> Result<ShaIvcRun> {
     let initial_state = vec![Fr::from(1u32)];
     let f_circuit = Sha256FCircuit::<Fr>::new(())?;
 
@@ -226,7 +268,7 @@ fn run_sha_chain(
     let pp = PreprocessorParam::new(poseidon_config, f_circuit);
     let nova_params = NovaSha::preprocess(&mut rng, &pp)?;
 
-    let mut fs = NovaSha::init(&nova_params, f_circuit, initial_state.clone())?;
+    let mut fs = NovaSha::init(&nova_params, f_circuit, initial_state)?;
 
     let t_prove = Instant::now();
     for _ in 0..num_steps {
@@ -235,20 +277,82 @@ fn run_sha_chain(
     let prove_ms = t_prove.elapsed().as_millis() as u64;
 
     let ivc_proof = fs.ivc_proof();
-    let final_state = ivc_proof.z_i.clone();
+    let final_z = ivc_proof.z_i[0];
 
     let t_verify = Instant::now();
-    NovaSha::verify(nova_params.1, ivc_proof.clone())?;
+    NovaSha::verify(nova_params.1.clone(), ivc_proof.clone())?;
     let verify_ms = t_verify.elapsed().as_millis() as u64;
 
     let mut buf = Vec::new();
     ivc_proof.serialize_compressed(&mut buf)?;
 
-    if let Some(p) = out_proof {
-        std::fs::write(p, &buf)?;
-    }
+    Ok(ShaIvcRun {
+        nova: fs,
+        nova_params: nova_params.0,
+        nova_vp: nova_params.1,
+        f_circuit,
+        final_z,
+        ivc_proof_bytes: buf,
+        prove_ms,
+        verify_ms,
+    })
+}
 
-    Ok((buf, final_state[0], prove_ms, verify_ms))
+fn run_sha_chain(
+    num_steps: usize,
+    out_proof: Option<&Path>,
+) -> Result<(Vec<u8>, Fr, u64, u64)> {
+    let r = run_sha_chain_full(num_steps)?;
+    if let Some(p) = out_proof {
+        std::fs::write(p, &r.ivc_proof_bytes)?;
+    }
+    Ok((r.ivc_proof_bytes, r.final_z, r.prove_ms, r.verify_ms))
+}
+
+/// Numbers from a Decider (Groth16/BN254 wrap) run on top of an IVC accumulator.
+struct DeciderRun {
+    proof_bytes: usize,
+    decider_prove_ms: u64,
+    decider_verify_ms: u64,
+    decider_setup_ms: u64,
+}
+
+fn run_decider_sha(r: ShaIvcRun) -> Result<DeciderRun> {
+    let mut rng = rand::rngs::OsRng;
+    let t_setup = Instant::now();
+    let (decider_pp, decider_vp) = DeciderSha::preprocess(
+        &mut rng,
+        ((r.nova_params, r.nova_vp.clone()), r.f_circuit.state_len()),
+    )?;
+    let decider_setup_ms = t_setup.elapsed().as_millis() as u64;
+
+    let t_prove = Instant::now();
+    let proof = DeciderSha::prove(rng, decider_pp, r.nova.clone())?;
+    let decider_prove_ms = t_prove.elapsed().as_millis() as u64;
+
+    let mut buf = Vec::new();
+    proof.serialize_compressed(&mut buf)?;
+    let proof_bytes = buf.len();
+
+    let t_verify = Instant::now();
+    let ok = DeciderSha::verify(
+        decider_vp,
+        r.nova.i,
+        r.nova.z_0.clone(),
+        r.nova.z_i.clone(),
+        &r.nova.U_i.get_commitments(),
+        &r.nova.u_i.get_commitments(),
+        &proof,
+    )?;
+    let decider_verify_ms = t_verify.elapsed().as_millis() as u64;
+    anyhow::ensure!(ok, "DeciderEth verify returned false");
+
+    Ok(DeciderRun {
+        proof_bytes,
+        decider_prove_ms,
+        decider_verify_ms,
+        decider_setup_ms,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -268,11 +372,18 @@ fn clamp_native(coeff_u16: u16) -> u8 {
     }
 }
 
-fn run_toy_decode(
-    coeffs: &[u16],
-    out_proof: Option<&Path>,
-) -> Result<(Vec<u8>, (Fr, Fr), u64, u64)> {
-    use ark_ff::PrimeField;
+struct ToyIvcRun {
+    nova: NovaToy,
+    nova_params: <NovaToy as FoldingScheme<Projective, Projective2, ToyDecodeFCircuit<Fr>>>::ProverParam,
+    nova_vp: <NovaToy as FoldingScheme<Projective, Projective2, ToyDecodeFCircuit<Fr>>>::VerifierParam,
+    f_circuit: ToyDecodeFCircuit<Fr>,
+    final_state: (Fr, Fr),
+    ivc_proof_bytes: Vec<u8>,
+    prove_ms: u64,
+    verify_ms: u64,
+}
+
+fn run_toy_decode_full(coeffs: &[u16]) -> Result<ToyIvcRun> {
     let initial_state = vec![Fr::from(0u32), Fr::from(0u32)];
     let f_circuit = ToyDecodeFCircuit::<Fr>::new(())?;
 
@@ -292,20 +403,74 @@ fn run_toy_decode(
     let prove_ms = t_prove.elapsed().as_millis() as u64;
 
     let ivc_proof = fs.ivc_proof();
-    let final_state = ivc_proof.z_i.clone();
+    let final_state = (ivc_proof.z_i[0], ivc_proof.z_i[1]);
 
     let t_verify = Instant::now();
-    NovaToy::verify(nova_params.1, ivc_proof.clone())?;
+    NovaToy::verify(nova_params.1.clone(), ivc_proof.clone())?;
     let verify_ms = t_verify.elapsed().as_millis() as u64;
 
     let mut buf = Vec::new();
     ivc_proof.serialize_compressed(&mut buf)?;
 
-    if let Some(p) = out_proof {
-        std::fs::write(p, &buf)?;
-    }
+    Ok(ToyIvcRun {
+        nova: fs,
+        nova_params: nova_params.0,
+        nova_vp: nova_params.1,
+        f_circuit,
+        final_state,
+        ivc_proof_bytes: buf,
+        prove_ms,
+        verify_ms,
+    })
+}
 
-    Ok((buf, (final_state[0], final_state[1]), prove_ms, verify_ms))
+fn run_toy_decode(
+    coeffs: &[u16],
+    out_proof: Option<&Path>,
+) -> Result<(Vec<u8>, (Fr, Fr), u64, u64)> {
+    let r = run_toy_decode_full(coeffs)?;
+    if let Some(p) = out_proof {
+        std::fs::write(p, &r.ivc_proof_bytes)?;
+    }
+    Ok((r.ivc_proof_bytes, r.final_state, r.prove_ms, r.verify_ms))
+}
+
+fn run_decider_toy(r: ToyIvcRun) -> Result<DeciderRun> {
+    let mut rng = rand::rngs::OsRng;
+    let t_setup = Instant::now();
+    let (decider_pp, decider_vp) = DeciderToy::preprocess(
+        &mut rng,
+        ((r.nova_params, r.nova_vp.clone()), r.f_circuit.state_len()),
+    )?;
+    let decider_setup_ms = t_setup.elapsed().as_millis() as u64;
+
+    let t_prove = Instant::now();
+    let proof = DeciderToy::prove(rng, decider_pp, r.nova.clone())?;
+    let decider_prove_ms = t_prove.elapsed().as_millis() as u64;
+
+    let mut buf = Vec::new();
+    proof.serialize_compressed(&mut buf)?;
+    let proof_bytes = buf.len();
+
+    let t_verify = Instant::now();
+    let ok = DeciderToy::verify(
+        decider_vp,
+        r.nova.i,
+        r.nova.z_0.clone(),
+        r.nova.z_i.clone(),
+        &r.nova.U_i.get_commitments(),
+        &r.nova.u_i.get_commitments(),
+        &proof,
+    )?;
+    let decider_verify_ms = t_verify.elapsed().as_millis() as u64;
+    anyhow::ensure!(ok, "DeciderEth verify returned false");
+
+    Ok(DeciderRun {
+        proof_bytes,
+        decider_prove_ms,
+        decider_verify_ms,
+        decider_setup_ms,
+    })
 }
 
 fn fr_to_hex(f: &Fr) -> String {
@@ -417,16 +582,22 @@ fn cmd_bench(
     fixture_dir: PathBuf,
     out: Option<PathBuf>,
     max_steps: usize,
+    decider: bool,
 ) -> Result<()> {
     let sizes = [("1k", 1024usize), ("1m", 1_048_576), ("10m", 10_485_760)];
 
-    let system = match workload {
+    let system_base = match workload {
         Workload::Sha256Chain => "sonobe-nova-sha256-chain",
         Workload::ToyDecode => "sonobe-nova-toy-decode",
     };
+    let system = if decider {
+        format!("{}-decider", system_base)
+    } else {
+        system_base.to_string()
+    };
 
     let mut partial = BenchResult {
-        system: system.to_string(),
+        system,
         toolchain: format!("sonobe-{}", env!("CARGO_PKG_VERSION")),
         gpu: None,
         verifier_wasm_gz_bytes: None,
@@ -443,19 +614,62 @@ fn cmd_bench(
 
         let data = std::fs::read(&fixture).context(format!("read {}", fixture.display()))?;
 
-        let (buf, prove_ms, verify_ms, num_steps) = match workload {
-            Workload::Sha256Chain => {
-                let n = sha_steps(data.len(), max_steps);
-                let (b, _z, p, v) = run_sha_chain(n, None)?;
-                (b, p, v, n)
-            }
-            Workload::ToyDecode => {
-                let coeffs: Vec<u16> =
-                    data.iter().take(max_steps).map(|&b| b as u16).collect();
-                let n = coeffs.len();
-                let (b, _s, p, v) = run_toy_decode(&coeffs, None)?;
-                (b, p, v, n)
-            }
+        // Run the IVC, optionally fold the Decider step on top.
+        let (ivc_proof_bytes_len, ivc_prove_ms, ivc_verify_ms, num_steps, decider_run) =
+            match workload {
+                Workload::Sha256Chain => {
+                    let n = sha_steps(data.len(), max_steps);
+                    let r = run_sha_chain_full(n)?;
+                    let dr = if decider {
+                        Some(run_decider_sha(ShaIvcRun {
+                            nova: r.nova.clone(),
+                            nova_params: r.nova_params.clone(),
+                            nova_vp: r.nova_vp.clone(),
+                            f_circuit: r.f_circuit,
+                            final_z: r.final_z,
+                            ivc_proof_bytes: r.ivc_proof_bytes.clone(),
+                            prove_ms: r.prove_ms,
+                            verify_ms: r.verify_ms,
+                        })?)
+                    } else {
+                        None
+                    };
+                    (r.ivc_proof_bytes.len(), r.prove_ms, r.verify_ms, n, dr)
+                }
+                Workload::ToyDecode => {
+                    let coeffs: Vec<u16> =
+                        data.iter().take(max_steps).map(|&b| b as u16).collect();
+                    let n = coeffs.len();
+                    let r = run_toy_decode_full(&coeffs)?;
+                    let dr = if decider {
+                        Some(run_decider_toy(ToyIvcRun {
+                            nova: r.nova.clone(),
+                            nova_params: r.nova_params.clone(),
+                            nova_vp: r.nova_vp.clone(),
+                            f_circuit: r.f_circuit,
+                            final_state: r.final_state,
+                            ivc_proof_bytes: r.ivc_proof_bytes.clone(),
+                            prove_ms: r.prove_ms,
+                            verify_ms: r.verify_ms,
+                        })?)
+                    } else {
+                        None
+                    };
+                    (r.ivc_proof_bytes.len(), r.prove_ms, r.verify_ms, n, dr)
+                }
+            };
+
+        // When --decider is set, the row reports Decider numbers (final
+        // proof bytes + Groth16 verify ms); the IVC times are absorbed
+        // into prove_ms (= IVC prove + Decider prove).
+        let (prove_ms, verify_ms, proof_bytes) = if let Some(d) = decider_run {
+            (
+                ivc_prove_ms + d.decider_prove_ms + d.decider_setup_ms,
+                d.decider_verify_ms,
+                d.proof_bytes,
+            )
+        } else {
+            (ivc_prove_ms, ivc_verify_ms, ivc_proof_bytes_len)
         };
 
         partial.rows.push(Row {
@@ -464,13 +678,13 @@ fn cmd_bench(
             cycles: num_steps as u64,
             prove_ms,
             verify_native_ms: verify_ms,
-            proof_bytes: buf.len(),
+            proof_bytes,
             peak_rss_bytes: get_peak_rss(),
         });
 
         println!(
             "{}: {} steps, prove {} ms, verify {} ms, proof {} bytes",
-            label, num_steps, prove_ms, verify_ms, buf.len()
+            label, num_steps, prove_ms, verify_ms, proof_bytes
         );
         let _ = std::io::stdout().flush();
 
@@ -505,6 +719,7 @@ fn main() -> Result<()> {
             fixture_dir,
             out,
             max_steps,
-        } => cmd_bench(workload, fixture_dir, out, max_steps),
+            decider,
+        } => cmd_bench(workload, fixture_dir, out, max_steps, decider),
     }
 }

@@ -37,6 +37,7 @@ solidity-verifiers = { git = "https://github.com/privacy-scaling-explorations/so
 # resolve compatible versions).
 ark-bn254 = "0.5"
 ark-grumpkin = "0.5"
+ark-groth16 = "0.5"
 ark-ff = "0.5"
 ark-ec = "0.5"
 ark-r1cs-std = "0.5"
