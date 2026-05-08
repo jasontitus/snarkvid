@@ -78,33 +78,33 @@ Jolt fails the strict reading of the browser-verifier filter. We scaffolded it a
 
 Same workload semantics as M1; not the same hardware as M1's Lambda A10. **These numbers are CPU-only**; the SP1 row from M1 below is the GPU result on A10 for context. All numbers from `spike/bench/results/`.
 
-| System | Workload | Size | Prove | Verify | Proof | Peak RSS |
-|---|---|---:|---:|---:|---:|---:|
-| **Jolt** (CPU, this sandbox) | SHA-256 | 1 KB | **4.3 s** | 126 ms | * | 11.3 GB |
-| **Jolt** (CPU, this sandbox) | toy-decode 16×16 | 384 B | 4.5 s | 127 ms | * | 5.7 GB |
-| **Sonobe Nova** (CPU) | SHA-256 chain (32 steps) | 1 KB | 20.7 s | 45 ms | 12.2 MB | 372 MB |
-| **Sonobe Nova** (CPU) | SHA-256 chain (32 steps) | 1 MB | 20.9 s | 41 ms | 12.2 MB | 410 MB |
-| **Sonobe Nova** (CPU) | SHA-256 chain (32 steps) | 10 MB | 20.8 s | 48 ms | 12.2 MB | 420 MB |
-| **Sonobe Nova** (CPU) | toy-decode (32 steps clamp) | any | 12.4 s | 31 ms | 7.2 MB | 260 MB |
-| SP1 (M1 GPU A10, for ref) | SHA-256 | 1 KB | 818 ms | 114 ms | 2.7 MB | — |
-| SP1 (M1 CPU, for ref) | SHA-256 | 1 KB | 26 s | 110 ms | 2.7 MB | 8 GB |
-
-`*` Jolt's `JoltProof` type doesn't impl `Clone` or `serde::Serialize` in the May 2026 main, so the spike host doesn't currently serialize the proof to disk. Reported as 0 bytes; recorded as a known gap.
+| System | Workload | Size | Cycles | Prove | Verify | Proof | Peak RSS |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **Jolt** (CPU, this sandbox) | SHA-256 | 1 KB | 53,032 | **4.0 s** | 120 ms | 80,281 B | 11.3 GB |
+| **Jolt** (CPU, this sandbox) | toy-decode 16×16 (real WHT) | 384 B | 108,816 | 6.0 s | 132 ms | 83,817 B | 5.7 GB |
+| **Sonobe Nova** (CPU) | SHA-256 chain (32 steps) | 1 KB | 32 steps | 20.7 s | 45 ms | 12.2 MB | 372 MB |
+| **Sonobe Nova** (CPU) | SHA-256 chain (32 steps) | 1 MB | 32 steps | 20.9 s | 41 ms | 12.2 MB | 410 MB |
+| **Sonobe Nova** (CPU) | SHA-256 chain (32 steps) | 10 MB | 32 steps | 20.8 s | 48 ms | 12.2 MB | 420 MB |
+| **Sonobe Nova** (CPU) | toy-decode (32 steps clamp) | any | 32 steps | 12.4 s | 31 ms | 7.2 MB | 260 MB |
+| **Sonobe Decider** | Groth16 wrap on top of IVC | n/a | — | OOM at >16 GB anon-rss in 15 GiB sandbox | — | ~200 B (target) | >16 GB |
+| SP1 (M1 GPU A10, for ref) | SHA-256 | 1 KB | 90,887 | 818 ms | 114 ms | 2.7 MB | — |
+| SP1 (M1 CPU, for ref) | SHA-256 | 1 KB | 90,887 | 26 s | 110 ms | 2.7 MB | 8 GB |
 
 ### Reading the table
 
-- **Jolt is the CPU-prove winner.** 4.3 s on 1 KB SHA-256 = **6× faster than SP1's CPU baseline (26 s)** and **~5× faster** than SP1's A10 GPU number once you account for the precompile (M1 SP1 used the SHA-256 precompile; Jolt here uses `jolt-inlines-sha2`). Roughly half a million RV cycles/sec in this sandbox.
+- **Jolt is the CPU-prove winner.** 4.0 s on 1 KB SHA-256 = **6× faster than SP1's CPU baseline (26 s)** and **~5× faster** than SP1's A10 GPU number once you account for the precompile (M1 SP1 used the SHA-256 precompile; Jolt here uses `jolt-inlines-sha2`). Roughly half a million RV cycles/sec in this sandbox.
+- **Real toy-codec costs ~41k extra Jolt cycles per 16×16 frame.** The toy-decode row went from 67k cycles (clamp passthrough) to 109k (real 8×8 Walsh–Hadamard inverse + dequant) when the codec stub was replaced with the M2 codec. That ~41k delta is the per-frame budget M3's H.264 decoder is gambling against.
 - **Sonobe Nova IVC is linear-in-step-count and slow per step.** ~650 ms per fold step for the SHA-256 chain workload. The 1 MB / 10 MB rows show identical numbers because the spike caps at 32 fold steps to keep CPU runs sane. Extrapolating: a 1 MB fixture (32k steps) is ~5.7 hours; 10 MB is ~59 hours. **Folding doesn't beat zkVMs on short inputs.** Where it shines is per-macroblock loops where the same step circuit is folded many thousands of times — and where the IVC accumulator is then collapsed by a Decider into a constant-size Groth16 proof.
-- **Sonobe IVC accumulator size (12 MB / 7 MB) is misleading.** That's the un-Decided proof. With the Groth16 Decider it collapses to ~200 bytes. Decider not exercised in this spike.
+- **Sonobe IVC accumulator size (12 MB / 7 MB) is misleading on its own.** That's the un-Decided proof. The DeciderEth wrap (Groth16/BN254) collapses it to ~200 B; that path is now wired (`sonobe-script bench --decider`) but OOM'd in the 15 GiB sandbox during Groth16 setup. Sandbox-deferred to a Lambda A10 (≥ 32 GB) per `TESTING.md`.
 - **Jolt memory cost is heavy** (11 GB peak for 1 KB SHA-256) — this matters for our M3 chunk sizing.
-- **Jolt cycle counts are not in the JSON.** Jolt logs them via `tracing` (RUST_LOG=info); the spike host doesn't yet capture them. From logs: 53,032 RV cycles for the 1 KB SHA-256 fixture.
+- **Jolt cycle counts and proof bytes are now captured.** A custom `tracing_subscriber::Layer` scrapes the "X total cycles" line out of Jolt's log stream into the bench JSON; `ark_serialize::CanonicalSerialize` produces real proof bytes (~80 KB). Both were `0` in the original M1b numbers.
 
 ### What this does NOT measure
 
 - GPU prove times for either candidate. Neither has a public CUDA path; LayerZero's Jolt-CUDA fork is closed and not in upstream.
-- Proof size for Jolt (see asterisk above).
-- Browser verify time for either. Sonobe needs a Decider run to get to a Groth16 proof first; Jolt has no browser verifier at all.
+- Browser verify time for either. Sonobe needs a Decider run on a ≥ 32 GB box first (sandbox OOM); Jolt has no browser verifier at all. `scripts/full_test_gpu.sh` phase 8 runs the Sonobe Decider on the GPU instance.
 - 1 MB / 10 MB rows for Jolt — would require a longer wall-clock budget than this sandbox allows. Sonobe rows at those sizes are step-count-capped, so identical numbers.
+- SP1's toy-decode row, where SP1 runs the same 16×16 frame through the new RISC-V `toy-decode` guest. The host code is committed; the guest never built in this sandbox because `sp1up` couldn't reach `api.github.com`. `scripts/full_test_gpu.sh` phase 5 builds and runs it on the GPU instance.
 
 ## 5. How this maps to the end goal
 

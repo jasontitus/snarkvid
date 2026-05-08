@@ -391,31 +391,19 @@ fn cmd_verify(
     min_size: u32,
 ) -> Result<()> {
     let proof_bytes = std::fs::read(&proof).context("read proof")?;
-    match workload {
-        Workload::Sha256 => {
-            let expected = hex_to_bytes(&commit)?;
-            anyhow::ensure!(expected.len() == 32, "commit must be 32 bytes");
-            // Re-running verify needs the original `data` (Jolt's verifier
-            // takes the inputs alongside the proof). The CLI shape here
-            // doesn't carry data through to verify on its own — for
-            // milestone-1b we report the full prove+verify round-trip
-            // numbers and skip standalone verify-from-proof. SP1 has the
-            // same limitation in spike/sp1/script/src/main.rs Verify.
-            eprintln!(
-                "Jolt verify-from-proof requires the original input bytes \
-                 alongside the proof. Run `prove` and capture the verify_ms it \
-                 reports, or extend the CLI to carry `--input` through."
-            );
-            let _ = (proof_bytes, expected, min_size);
-        }
-        Workload::ToyDecode => {
-            eprintln!(
-                "Jolt verify-from-proof requires the original input bytes \
-                 alongside the proof; see Sha256 branch."
-            );
-            let _ = proof_bytes;
-        }
-    }
+    let _ = (proof_bytes, commit, min_size, workload);
+    // Standalone verify-from-proof needs the resolved `JoltProof<F, C, PCS, FS>`
+    // type to call `CanonicalDeserialize`. Jolt's `#[jolt::provable]` macro
+    // doesn't re-export that resolved type — the prover/verifier closures
+    // capture it internally — so the host can't deserialize without
+    // importing `jolt-core`'s field/curve/PCS/transcript types and pinning
+    // the same instantiation Jolt picks. That's more coupling than the
+    // M1b spike warrants. Tracked in TESTING.md as a known gap.
+    eprintln!(
+        "Jolt verify-from-proof is not wired; re-run `jolt-script prove` for \
+         a verified round trip (prove already calls verify in-process and \
+         asserts validity). See TESTING.md for why."
+    );
     Ok(())
 }
 

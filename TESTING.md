@@ -24,7 +24,7 @@ whose numbers are already in this repo.
 |---|---|---|---|
 | `crates/toy-codec` | 10 unit tests: WHT self-inverse, qp=0 lossless on flat/ramp/noise frames, qp=8 ≥ 40 dB PSNR on noise, qp monotonicity, dim/qp validation | PASS | `cargo test -p snarkvid-toy-codec` |
 | `crates/comparator` | 2 unit tests: identical→∞ PSNR, off-by-one→~48 dB | PASS | `cargo test -p snarkvid-comparator` |
-| `crates/manifest` | 3 unit tests: Merkle root single/two leaves, tampering detected | PASS (Ed25519 verify is **stubbed** — see "Known gaps" below) | `cargo test -p snarkvid-manifest` |
+| `crates/manifest` | 11 unit tests: real Ed25519 sign/verify round-trip, all four M2 §3.4 tampering modes (body bit-flip, sig bit-flip, swapped pubkey, invalid pubkey bytes), Merkle root + path generator round-trip on power-of-two and odd-length leaves | PASS | `cargo test -p snarkvid-manifest` |
 | `bin/toy-encode` | Compiles + smoke-encodes a YUV file | PASS | builds clean as part of workspace |
 | Jolt SHA-256 1KB | CPU prove + verify round-trip, cycles + proof bytes captured | PASS — 53,032 cycles / 80,281 B / 4,031 ms prove / 120 ms verify | `spike/bench/results/jolt-sha256.json` |
 | Jolt toy-decode 16×16 | CPU prove + verify with real WHT decoder in the loop | PASS — 108,816 cycles / 83,817 B / 5,962 ms prove / 132 ms verify | `spike/bench/results/jolt-toy-decode.json` |
@@ -54,12 +54,11 @@ nothing to run yet. Tracking here so they don't get lost.
 
 | Gap | Where | Impact |
 |---|---|---|
-| Real Ed25519 verify | `crates/manifest::verify_manifest` accepts any signature today | Blocks M2 §3.4 tampering tests ("manifest signed by unknown key → fails closed") |
-| Manifest signing helper | `crates/manifest` has no `sign_manifest()` | Host can't produce signed-manifest fixtures for the prover to consume |
-| Merkle path generator | `crates/manifest::verify_merkle_path` exists; `merkle_path()` builder doesn't | Host has to construct paths by hand to feed the prover |
-| Browser verifier (Sonobe Decider) | `spike/web/` exists for SP1 but not yet for the Decider's Groth16/BN254 proof | M2 §3.3 acceptance ("verify in a browser, < 2 s") not yet exercised |
-| Jolt `verify` subcommand | Currently stubbed — needs `--input` carried through to verify-from-proof | Doesn't block bench; nice-to-have for round-trip robustness |
-| Sonobe `verify` subcommand | Re-runs preprocessing instead of loading verifier params from disk | Verify times in JSON include preprocessing; flag in report |
+| Browser verifier (Sonobe Decider) | `spike/web/` exists for SP1 but not yet for the Decider's Groth16/BN254 proof | M2 §3.3 acceptance ("verify in a browser, < 2 s") not yet exercised. Blocked by phase 8 producing a Decider proof on disk. |
+| Jolt verify-from-proof | Tried; blocked. The `JoltProof<F, C, PCS, FS>` type isn't re-exported by `#[jolt::provable]`. Wiring `CanonicalDeserialize` requires importing `jolt-core`'s field/curve/PCS/transcript types and pinning Jolt's exact instantiation — tighter coupling than the spike warrants. | Doesn't block bench (prove already calls verify in-process). Re-evaluate if Jolt is picked at the M3 prover-pick gate. |
+| Sonobe verify-from-proof | Functional but slow — re-runs preprocessing every call instead of caching verifier params | Verify times reported by `cmd_verify` include preprocessing; bench numbers are unaffected (they don't re-preprocess). |
+| M2 prover & end-to-end statement | The full M2 statement (signed manifest + Merkle auth + decode_toy + PSNR comparator, all in one proof) isn't built yet | Each piece exists native; the prover/guest binary that composes them is the next M2 milestone. |
+| `crates/manifest` no_std purity | Crate carries `#![no_std]` but pulls `ed25519-dalek` with default features (which include `std`). Source compiles with no_std symbols only. | Doesn't block native use. M3 in-circuit guest will need `default-features = false, features = ["alloc"]` on the dalek dep. |
 
 ## Re-running individual phases
 
