@@ -30,6 +30,7 @@ pub mod bitreader;
 pub mod cavlc;
 pub mod nal;
 pub mod quant;
+pub mod slice;
 pub mod transform;
 
 /// Errors that can occur during H.264 decoding.
