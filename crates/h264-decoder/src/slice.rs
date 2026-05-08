@@ -286,10 +286,8 @@ pub struct SliceHeader {
 }
 
 impl SliceHeader {
-    /// Parse the slice header out of a slice NAL's RBSP. `is_idr` is
-    /// the caller's hint from the NAL unit type (5 = IDR slice, 1 =
-    /// non-IDR). Needs both `sps` and `pps` for the field-conditional
-    /// parses and for SliceQPY derivation.
+    /// Parse the slice header out of a slice NAL's RBSP. Convenience
+    /// wrapper around `parse_into` that builds a fresh BitReader.
     pub fn parse(
         rbsp: &[u8],
         sps: &Sps,
@@ -297,6 +295,18 @@ impl SliceHeader {
         is_idr: bool,
     ) -> Result<SliceHeader, DecodeError> {
         let mut br = BitReader::new(rbsp);
+        Self::parse_into(&mut br, sps, pps, is_idr)
+    }
+
+    /// Parse the slice header off an existing BitReader, advancing
+    /// the cursor past the header. Use this when you want to read
+    /// macroblock data after the header from the same cursor.
+    pub fn parse_into(
+        br: &mut BitReader,
+        sps: &Sps,
+        pps: &Pps,
+        is_idr: bool,
+    ) -> Result<SliceHeader, DecodeError> {
         let first_mb_in_slice = br.read_ue()?;
         if first_mb_in_slice != 0 {
             return Err(DecodeError::OutOfScope("first_mb_in_slice != 0 (multi-slice)"));

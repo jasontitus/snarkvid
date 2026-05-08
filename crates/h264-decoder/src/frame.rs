@@ -58,11 +58,6 @@ pub struct DecodedFrame {
 pub fn decode_iframe(bitstream: &[u8]) -> Result<DecodedFrame, DecodeError> {
     let (sps, pps, slice_rbsp, slice_is_idr) = collect_units(bitstream)?;
 
-    let sh = SliceHeader::parse(&slice_rbsp, &sps, &pps, slice_is_idr)?;
-    if sh.first_mb_in_slice != 0 {
-        return Err(DecodeError::OutOfScope("multi-slice IDR not supported"));
-    }
-
     let pic_w = sps.pic_width() as usize;
     let pic_h = sps.pic_height() as usize;
     if pic_w == 0 || pic_h == 0 {
@@ -79,28 +74,13 @@ pub fn decode_iframe(bitstream: &[u8]) -> Result<DecodedFrame, DecodeError> {
     let mut u_plane = vec![128u8; (pic_w / 2) * (pic_h / 2)];
     let mut v_plane = vec![128u8; (pic_w / 2) * (pic_h / 2)];
 
-    // Walk MBs in raster order.
+    // Walk MBs in raster order on a single BitReader so the slice
+    // header cursor advances naturally into the macroblock layer.
     let mut br = BitReader::new(&slice_rbsp);
-    // The slice header has already been consumed *into a different
-    // BitReader*; we need to re-parse to align our cursor. The
-    // simplest correct path is to call SliceHeader::parse again
-    // in dry-run mode just to advance our cursor identically. Since
-    // SliceHeader::parse doesn't expose its end position, we do
-    // it inline here by re-parsing: we already parsed `sh` above
-    // which advanced its own cursor; we need that same cursor.
-    //
-    // Refactor opportunity: SliceHeader::parse should return
-    // (header, BitReader) so the caller has the post-header cursor.
-    // For now, re-parse to advance our `br`:
-    let _resync = SliceHeader::parse(&slice_rbsp, &sps, &pps, slice_is_idr)?;
-    // (`_resync` is the same `sh` as above; calling it again with the
-    // same bytes advances `br` to the same end position as the
-    // earlier call did on its own cursor.)
-
-    // Bit reader state-machine note: the above approach reads the
-    // header twice, which is wasteful but correctness-preserving.
-    // Refactor to a single parse + cursor-position-tracking is in the
-    // TODO list along with the residual integration.
+    let sh = SliceHeader::parse_into(&mut br, &sps, &pps, slice_is_idr)?;
+    if sh.first_mb_in_slice != 0 {
+        return Err(DecodeError::OutOfScope("multi-slice IDR not supported"));
+    }
 
     // Initial QP for this slice (already accounting for slice_qp_delta).
     let mut qp_y: i32 = sh.slice_qp_y;
