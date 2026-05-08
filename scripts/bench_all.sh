@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Build both zkVM sides and run CPU benchmarks on all fixtures.
-# Prerequisites: run setup_sp1.sh, setup_risc0.sh, uncomment_risc0_deps.sh first.
-# Gracefully skips RISC Zero if it failed to build.
+# Build all four spike sides and run CPU benchmarks on all fixtures.
+# Prerequisites:
+#   scripts/setup_sp1.sh
+#   scripts/setup_risc0.sh + scripts/uncomment_risc0_deps.sh
+#   scripts/setup_sonobe.sh
+#   scripts/setup_jolt.sh
+# Gracefully skips any side that fails to build.
 set -euo pipefail
 
 # Use rustup shims so `+succinct` / `+risc0` toolchain selection works.
@@ -56,6 +60,70 @@ if [[ "$RISC0_OK" -eq 1 && -f spike/risc0/target/release/risc0-host ]]; then
         --fixture-dir "$FIXTURES" --out "$RESULTS/risc0.json" || true
 else
     echo "Skipping — RISC Zero not built"
+fi
+
+# ---- Build Sonobe ----
+echo ""
+echo "=== Building Sonobe ==="
+SONOBE_OK=0
+if (cd spike/sonobe && cargo build --release 2>&1 | tail -5); then
+    SONOBE_OK=1
+fi
+if [[ "$SONOBE_OK" -eq 1 && -f spike/sonobe/target/release/sonobe-script ]]; then
+    echo "Sonobe binary: $(ls -lh spike/sonobe/target/release/sonobe-script | awk '{print $5}')"
+else
+    echo "Sonobe did not build — skipping. See spike/sonobe/README.md for the API churn note."
+fi
+
+# ---- Build Jolt ----
+echo ""
+echo "=== Building Jolt ==="
+JOLT_OK=0
+if (cd spike/jolt && cargo build --release 2>&1 | tail -5); then
+    JOLT_OK=1
+fi
+if [[ "$JOLT_OK" -eq 1 && -f spike/jolt/target/release/jolt-script ]]; then
+    echo "Jolt binary: $(ls -lh spike/jolt/target/release/jolt-script | awk '{print $5}')"
+else
+    echo "Jolt did not build — skipping. See spike/jolt/README.md for the SHA-pin note."
+fi
+
+# ---- Run Sonobe benchmarks ----
+echo ""
+echo "=== Sonobe bench (sha256-chain, max-steps=${MAX_STEPS:-1024}) ==="
+if [[ "$SONOBE_OK" -eq 1 && -f spike/sonobe/target/release/sonobe-script ]]; then
+    spike/sonobe/target/release/sonobe-script bench \
+        --workload sha256-chain \
+        --fixture-dir "$FIXTURES" \
+        --max-steps "${MAX_STEPS:-1024}" \
+        --out "$RESULTS/sonobe-sha256.json" || true
+    spike/sonobe/target/release/sonobe-script bench \
+        --workload toy-decode \
+        --fixture-dir "$FIXTURES" \
+        --max-steps "${MAX_STEPS:-1024}" \
+        --out "$RESULTS/sonobe-toy-decode.json" || true
+else
+    echo "Skipping — Sonobe not built"
+fi
+
+# ---- Run Jolt benchmarks ----
+echo ""
+echo "=== Jolt bench ==="
+if [[ "$JOLT_OK" -eq 1 && -f spike/jolt/target/release/jolt-script ]]; then
+    # jolt build -p <pkg> needs to run inside the workspace dir.
+    (
+        cd spike/jolt
+        timeout 1800 ./target/release/jolt-script bench \
+            --workload sha256 \
+            --fixture-dir ../common/bench-fixtures \
+            --out ../bench/results/jolt-sha256.json
+        timeout 1800 ./target/release/jolt-script bench \
+            --workload toy-decode \
+            --fixture-dir ../common/bench-fixtures \
+            --out ../bench/results/jolt-toy-decode.json
+    ) || true
+else
+    echo "Skipping — Jolt not built"
 fi
 
 # ---- Print results ----

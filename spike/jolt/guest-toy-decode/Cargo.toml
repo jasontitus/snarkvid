@@ -1,0 +1,22 @@
+# Sibling Jolt guest crate for the toy-decode workload. Jolt requires a
+# separate guest package per #[jolt::provable] function in May 2026 — the
+# macro expands to a top-level `main`/`jolt_panic` symbol, so two
+# provables in one crate would collide.
+
+[package]
+name = "snarkvid-spike-jolt-toy-decode"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+guest = []
+compute_advice = []
+
+[dependencies]
+jolt = { package = "jolt-sdk", git = "https://github.com/a16z/jolt.git", branch = "main", default-features = false }
+
+snarkvid-toy-codec = { path = "../../../crates/toy-codec", default-features = false }
+
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }

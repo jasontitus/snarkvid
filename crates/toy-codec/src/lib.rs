@@ -1,43 +1,52 @@
-// BlockQuant toy codec — a deliberately simple image codec for milestone 2.
+// BlockQuant toy codec — milestone 2's deliberately simple image codec.
 //
-// Designed to be the dumbest possible thing that still exercises real
-// integer arithmetic over real image data, without entropy coding or
-// motion compensation. This lets us shake out the full architecture
-// (manifest → Merkle → in-circuit decoder → comparator → browser
-// verifier) without an H.264 decoder in the loop.
+// Goal (see milestones/02-toy-transform.md §2): the dumbest possible
+// codec that still exercises real integer arithmetic over real image
+// data, without entropy coding or motion compensation. Lets us shake
+// out the full architecture (manifest → Merkle → in-circuit decoder →
+// comparator → browser verifier) before swapping in H.264 in M3.
 //
-// Codec sketch (see milestones/02-toy-transform.md §2):
+// Pipeline:
 //   1. Partition each YUV plane into 8×8 blocks (Y full-res, U/V 4:2:0).
-//   2. Forward transform: 2D Walsh-Hadamard (or integer DCT if fast enough).
-//   3. Uniform quantization with a single QP.
-//   4. Bitstream: header (width, height, qp, chroma_format) + i16 coeffs.
+//      Frame dims must be multiples of 16 so chroma blocks land cleanly.
+//   2. Forward 2D Walsh–Hadamard 8×8 over centered pixels (pixel - 128).
+//      Unnormalized: Y = H · X · H where H is the ±1 8×8 Hadamard matrix.
+//      Coefficients fit in i16 (DC magnitude ≤ 8·8·128 = 8192).
+//   3. Uniform quantization: q = round(Y / step) with step = max(1, qp).
+//      qp=0 → step=1 → bit-exact round trip (H X H is divisible by 64).
+//      qp=8 → step=8 → ~54 dB PSNR (well above M2's 40 dB floor).
+//   4. Bitstream: header (6 bytes) + i16 coefficients in block-raster
+//      order, Y plane then U then V.
+//   5. Decode is the reverse: dequantize → inverse 2D WHT → de-center
+//      (+128) → clamp to [0,255].
 //
-// Decode is the reverse: parse header → dequantize → inverse transform →
-// clamp to [0,255].
-//
-// This crate is no_std and provides both encode and decode. The in-circuit
-// decoder only calls decode_toy; the native toy-encode CLI calls encode_toy.
+// Both encode and decode are deterministic, panic-free, and produce
+// bit-exact output for a given input regardless of platform. The
+// crate is no_std so the same code runs natively (toy-encode CLI,
+// tests, host) and inside the zkVM guest. Same discipline we'll need
+// for the H.264 decoder in M3.
 
 #![no_std]
 
 extern crate alloc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 #[cfg(feature = "std")]
 extern crate std;
 
 /// A single YUV 4:2:0 frame.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct YuvFrame {
-    pub width: u16,   // must be multiple of 16 for 4:2:0
-    pub height: u16,  // must be multiple of 16 for 4:2:0
-    pub y: Vec<u8>,   // width * height
-    pub u: Vec<u8>,   // (width/2) * (height/2)
-    pub v: Vec<u8>,   // (width/2) * (height/2)
+    pub width: u16,
+    pub height: u16,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
 }
 
 /// BlockQuant bitstream header.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BqHeader {
     pub width: u16,
     pub height: u16,
@@ -46,7 +55,7 @@ pub struct BqHeader {
 }
 
 /// Compressed representation: header + coefficient stream.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BqBitstream {
     pub header: BqHeader,
     pub coeffs_y: Vec<i16>,
@@ -80,24 +89,186 @@ impl core::fmt::Display for ToyCodecError {
     }
 }
 
+const BLOCK: usize = 8;
+const BLOCK2: usize = BLOCK * BLOCK;
+
+/// Quantization step for a given QP. step=1 at qp=0 keeps the round
+/// trip bit-exact (H X H is divisible by 64 so the inverse rounds to
+/// the original integer). Larger steps increase reconstruction error
+/// linearly — at step=8, RMS error is ≈0.5 LSB (~54 dB PSNR).
+fn quant_step(qp: u8) -> i32 {
+    if qp == 0 {
+        1
+    } else {
+        qp as i32
+    }
+}
+
+/// 8-point unnormalized Walsh–Hadamard transform (in place, length 8).
+/// H X (where H is the symmetric ±1 8×8 Hadamard matrix). Self-inverse
+/// up to a factor of 8: applying it twice scales by 8.
+fn wht8(v: &mut [i32; BLOCK]) {
+    // Stage 1: pair sums/differences
+    let a0 = v[0] + v[1]; let a1 = v[0] - v[1];
+    let a2 = v[2] + v[3]; let a3 = v[2] - v[3];
+    let a4 = v[4] + v[5]; let a5 = v[4] - v[5];
+    let a6 = v[6] + v[7]; let a7 = v[6] - v[7];
+    // Stage 2: 4-point butterfly
+    let b0 = a0 + a2; let b2 = a0 - a2;
+    let b1 = a1 + a3; let b3 = a1 - a3;
+    let b4 = a4 + a6; let b6 = a4 - a6;
+    let b5 = a5 + a7; let b7 = a5 - a7;
+    // Stage 3: 8-point butterfly
+    v[0] = b0 + b4;
+    v[1] = b1 + b5;
+    v[2] = b2 + b6;
+    v[3] = b3 + b7;
+    v[4] = b0 - b4;
+    v[5] = b1 - b5;
+    v[6] = b2 - b6;
+    v[7] = b3 - b7;
+}
+
+/// 2D 8×8 WHT: apply 1D WHT along rows then columns.
+/// Identical for forward and inverse (only the post-scale differs).
+fn wht8x8(block: &mut [i32; BLOCK2]) {
+    // Rows
+    for r in 0..BLOCK {
+        let mut row: [i32; BLOCK] = [0; BLOCK];
+        for c in 0..BLOCK {
+            row[c] = block[r * BLOCK + c];
+        }
+        wht8(&mut row);
+        for c in 0..BLOCK {
+            block[r * BLOCK + c] = row[c];
+        }
+    }
+    // Columns
+    for c in 0..BLOCK {
+        let mut col: [i32; BLOCK] = [0; BLOCK];
+        for r in 0..BLOCK {
+            col[r] = block[r * BLOCK + c];
+        }
+        wht8(&mut col);
+        for r in 0..BLOCK {
+            block[r * BLOCK + c] = col[r];
+        }
+    }
+}
+
+/// Round-half-away-from-zero division by `d > 0`.
+fn div_round(n: i32, d: i32) -> i32 {
+    if n >= 0 {
+        (n + d / 2) / d
+    } else {
+        -((-n + d / 2) / d)
+    }
+}
+
+/// Forward-transform + quantize one 8×8 block of pixels into 64 i16
+/// coefficients. `pixels` are u8; centered to [-128, 127] before WHT.
+fn encode_block(pixels: &[u8; BLOCK2], step: i32) -> [i16; BLOCK2] {
+    let mut x: [i32; BLOCK2] = [0; BLOCK2];
+    for i in 0..BLOCK2 {
+        x[i] = pixels[i] as i32 - 128;
+    }
+    wht8x8(&mut x);
+    let mut out: [i16; BLOCK2] = [0; BLOCK2];
+    for i in 0..BLOCK2 {
+        let q = div_round(x[i], step);
+        // Clip to i16 range. Worst case unquantized magnitude is 8192,
+        // step ≥ 1 → ≤ 8192; well within ±32767.
+        out[i] = q.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    }
+    out
+}
+
+/// Dequantize + inverse-transform one block. Mirrors encode_block.
+fn decode_block(coeffs: &[i16; BLOCK2], step: i32) -> [u8; BLOCK2] {
+    let mut y: [i32; BLOCK2] = [0; BLOCK2];
+    for i in 0..BLOCK2 {
+        y[i] = coeffs[i] as i32 * step;
+    }
+    wht8x8(&mut y);
+    // 2D WHT applied twice = ×64. Divide by 64 with rounding, then
+    // de-center and clamp.
+    let mut out: [u8; BLOCK2] = [0; BLOCK2];
+    for i in 0..BLOCK2 {
+        let pixel = div_round(y[i], 64) + 128;
+        out[i] = pixel.clamp(0, 255) as u8;
+    }
+    out
+}
+
+/// Encode one whole plane (block-raster order: outer over block rows,
+/// inner over blocks, raster within block). `width` and `height` must
+/// already be multiples of 8.
+fn encode_plane(pixels: &[u8], width: usize, height: usize, step: i32) -> Vec<i16> {
+    let mut out = vec![0i16; width * height];
+    let bw = width / BLOCK;
+    let bh = height / BLOCK;
+    let mut block_pixels: [u8; BLOCK2] = [0; BLOCK2];
+    let mut idx = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            for r in 0..BLOCK {
+                for c in 0..BLOCK {
+                    block_pixels[r * BLOCK + c] = pixels[(by * BLOCK + r) * width + bx * BLOCK + c];
+                }
+            }
+            let coeffs = encode_block(&block_pixels, step);
+            out[idx..idx + BLOCK2].copy_from_slice(&coeffs);
+            idx += BLOCK2;
+        }
+    }
+    out
+}
+
+/// Decode one whole plane. Inverse of encode_plane.
+fn decode_plane(coeffs: &[i16], width: usize, height: usize, step: i32) -> Vec<u8> {
+    let mut out = vec![0u8; width * height];
+    let bw = width / BLOCK;
+    let bh = height / BLOCK;
+    let mut block_coeffs: [i16; BLOCK2] = [0; BLOCK2];
+    let mut idx = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            block_coeffs.copy_from_slice(&coeffs[idx..idx + BLOCK2]);
+            idx += BLOCK2;
+            let pixels = decode_block(&block_coeffs, step);
+            for r in 0..BLOCK {
+                for c in 0..BLOCK {
+                    out[(by * BLOCK + r) * width + bx * BLOCK + c] = pixels[r * BLOCK + c];
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Encode a YUV frame into a BlockQuant bitstream.
 ///
-/// The caller picks a QP (0 = lossless-ish, 51 = heaviest quantization).
-/// Higher QP → smaller coefficients → coarser reconstruction.
+/// QP: 0..=51. 0 = lossless round trip. 8 = ≳40 dB PSNR target. 51 =
+/// heavy quantization.
 pub fn encode_toy(frame: &YuvFrame, qp: u8) -> Result<BqBitstream, ToyCodecError> {
-    if frame.width % 16 != 0 || frame.height % 16 != 0 {
+    if frame.width == 0 || frame.height == 0 || frame.width % 16 != 0 || frame.height % 16 != 0 {
         return Err(ToyCodecError::InvalidDimensions);
     }
     if qp > 51 {
         return Err(ToyCodecError::Unsupported);
     }
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
+    if frame.y.len() != w * h || frame.u.len() != cw * ch || frame.v.len() != cw * ch {
+        return Err(ToyCodecError::BufferTooSmall);
+    }
 
-    // Milestone 2 day 1: implement the actual transform + quantization.
-    // For now, return a stub that passes coefficients through unmodified
-    // (lossless "QP=0").
-    let coeffs_y = frame.y.iter().map(|&b| b as i16).collect();
-    let coeffs_u = frame.u.iter().map(|&b| b as i16).collect();
-    let coeffs_v = frame.v.iter().map(|&b| b as i16).collect();
+    let step = quant_step(qp);
+    let coeffs_y = encode_plane(&frame.y, w, h, step);
+    let coeffs_u = encode_plane(&frame.u, cw, ch, step);
+    let coeffs_v = encode_plane(&frame.v, cw, ch, step);
 
     Ok(BqBitstream {
         header: BqHeader {
@@ -114,9 +285,7 @@ pub fn encode_toy(frame: &YuvFrame, qp: u8) -> Result<BqBitstream, ToyCodecError
 
 /// Decode a BlockQuant bitstream back into a YUV frame.
 ///
-/// This is the function the in-circuit decoder calls. It must be
-/// deterministic, panic-free, and produce bit-exact output for the
-/// same input regardless of platform or toolchain.
+/// In-circuit code calls this. Deterministic, panic-free, bit-exact.
 pub fn decode_toy(bitstream: &BqBitstream) -> Result<YuvFrame, ToyCodecError> {
     let BqHeader {
         width,
@@ -135,32 +304,22 @@ pub fn decode_toy(bitstream: &BqBitstream) -> Result<YuvFrame, ToyCodecError> {
         return Err(ToyCodecError::Unsupported);
     }
 
-    let y_size = width as usize * height as usize;
-    let uv_size = (width as usize / 2) * (height as usize / 2);
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let ch = h / 2;
 
-    if bitstream.coeffs_y.len() != y_size
-        || bitstream.coeffs_u.len() != uv_size
-        || bitstream.coeffs_v.len() != uv_size
+    if bitstream.coeffs_y.len() != w * h
+        || bitstream.coeffs_u.len() != cw * ch
+        || bitstream.coeffs_v.len() != cw * ch
     {
         return Err(ToyCodecError::BufferTooSmall);
     }
 
-    // Milestone 2 day 1: implement inverse transform + dequantization.
-    // Stub: for QP=0, coefficients are raw pixel values.
-    // For QP>0, need dequant + inverse transform + clamp.
-    let clamp = |v: i16| -> u8 {
-        if v < 0 {
-            0
-        } else if v > 255 {
-            255
-        } else {
-            v as u8
-        }
-    };
-
-    let y: Vec<u8> = bitstream.coeffs_y.iter().map(|&c| clamp(c)).collect();
-    let u: Vec<u8> = bitstream.coeffs_u.iter().map(|&c| clamp(c)).collect();
-    let v: Vec<u8> = bitstream.coeffs_v.iter().map(|&c| clamp(c)).collect();
+    let step = quant_step(qp);
+    let y = decode_plane(&bitstream.coeffs_y, w, h, step);
+    let u = decode_plane(&bitstream.coeffs_u, cw, ch, step);
+    let v = decode_plane(&bitstream.coeffs_v, cw, ch, step);
 
     Ok(YuvFrame {
         width,
@@ -174,24 +333,169 @@ pub fn decode_toy(bitstream: &BqBitstream) -> Result<YuvFrame, ToyCodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
 
-    /// Stub test — replace with real test vectors on milestone 2 day 1.
+    fn flat_frame(w: u16, h: u16, y: u8, u: u8, v: u8) -> YuvFrame {
+        let cw = (w / 2) as usize;
+        let ch = (h / 2) as usize;
+        YuvFrame {
+            width: w,
+            height: h,
+            y: vec![y; w as usize * h as usize],
+            u: vec![u; cw * ch],
+            v: vec![v; cw * ch],
+        }
+    }
+
+    fn ramp_frame(w: u16, h: u16) -> YuvFrame {
+        let wu = w as usize;
+        let hu = h as usize;
+        let cw = wu / 2;
+        let ch = hu / 2;
+        let y: Vec<u8> = (0..wu * hu).map(|i| (i & 0xff) as u8).collect();
+        let u: Vec<u8> = (0..cw * ch).map(|i| ((i * 3) & 0xff) as u8).collect();
+        let v: Vec<u8> = (0..cw * ch).map(|i| ((i * 5 + 17) & 0xff) as u8).collect();
+        YuvFrame { width: w, height: h, y, u, v }
+    }
+
+    /// Deterministic pseudo-random pattern via xorshift. Has enough
+    /// high-frequency content that quantization is observable.
+    fn noise_frame(w: u16, h: u16) -> YuvFrame {
+        fn xs(mut s: u32) -> u32 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            s
+        }
+        let wu = w as usize;
+        let hu = h as usize;
+        let cw = wu / 2;
+        let ch = hu / 2;
+        let mut y = Vec::with_capacity(wu * hu);
+        let mut state = 0xdeadbeefu32;
+        for _ in 0..wu * hu {
+            state = xs(state);
+            y.push((state & 0xff) as u8);
+        }
+        let mut u = Vec::with_capacity(cw * ch);
+        for _ in 0..cw * ch {
+            state = xs(state);
+            u.push((state & 0xff) as u8);
+        }
+        let mut v = Vec::with_capacity(cw * ch);
+        for _ in 0..cw * ch {
+            state = xs(state);
+            v.push((state & 0xff) as u8);
+        }
+        YuvFrame { width: w, height: h, y, u, v }
+    }
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mut sse: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i32 - b[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        10.0 * (255.0_f64 * 255.0 / mse).log10()
+    }
+
     #[test]
-    fn roundtrip_lossless_stub() {
-        let frame = YuvFrame {
-            width: 16,
-            height: 16,
-            y: vec![128u8; 256],
-            u: vec![128u8; 64],
-            v: vec![128u8; 64],
-        };
+    fn wht_self_inverse() {
+        // Forward then forward = ×8 (per 1D WHT). Test on a fixed pattern.
+        let mut v: [i32; 8] = [10, -3, 5, 17, -8, 0, 4, -1];
+        let original = v;
+        wht8(&mut v);
+        wht8(&mut v);
+        for i in 0..8 {
+            assert_eq!(v[i], original[i] * 8);
+        }
+    }
+
+    #[test]
+    fn wht8x8_self_inverse_scaled_by_64() {
+        let mut block: [i32; 64] = [0; 64];
+        for i in 0..64 {
+            block[i] = (i as i32) - 32;
+        }
+        let original = block;
+        wht8x8(&mut block);
+        wht8x8(&mut block);
+        for i in 0..64 {
+            assert_eq!(block[i], original[i] * 64);
+        }
+    }
+
+    #[test]
+    fn roundtrip_qp0_flat_block_lossless() {
+        let frame = flat_frame(16, 16, 128, 128, 128);
         let bs = encode_toy(&frame, 0).unwrap();
         let decoded = decode_toy(&bs).unwrap();
-        // Stub: encode passes through raw bytes, decode returns them.
-        // The real transform will not be lossless at QP>0.
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn roundtrip_qp0_ramp_lossless() {
+        // qp=0 should be bit-exact for any in-range frame.
+        let frame = ramp_frame(32, 32);
+        let bs = encode_toy(&frame, 0).unwrap();
+        let decoded = decode_toy(&bs).unwrap();
         assert_eq!(decoded.y, frame.y);
         assert_eq!(decoded.u, frame.u);
         assert_eq!(decoded.v, frame.v);
+    }
+
+    #[test]
+    fn qp8_meets_40db_psnr_on_noise() {
+        // M2 §3 acceptance: qp=8 should round-trip at PSNR ≥ 40 dB.
+        // Uses a high-entropy pattern so quantization is observable.
+        let frame = noise_frame(64, 64);
+        let bs = encode_toy(&frame, 8).unwrap();
+        let decoded = decode_toy(&bs).unwrap();
+        let p = psnr(&frame.y, &decoded.y);
+        assert!(p >= 40.0, "qp=8 PSNR(Y) = {} dB, expected ≥ 40", p);
+    }
+
+    #[test]
+    fn qp_monotonic_psnr_on_noise() {
+        // PSNR should drop as QP rises on a high-entropy pattern.
+        let frame = noise_frame(32, 32);
+        let bs0 = encode_toy(&frame, 0).unwrap();
+        let bs32 = encode_toy(&frame, 32).unwrap();
+        let p0 = psnr(&frame.y, &decode_toy(&bs0).unwrap().y);
+        let p32 = psnr(&frame.y, &decode_toy(&bs32).unwrap().y);
+        assert!(p0 > p32, "expected qp=0 PSNR > qp=32 PSNR (got {} vs {})", p0, p32);
+    }
+
+    #[test]
+    fn roundtrip_qp0_noise_lossless() {
+        let frame = noise_frame(32, 32);
+        let bs = encode_toy(&frame, 0).unwrap();
+        let decoded = decode_toy(&bs).unwrap();
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn rejects_non_16_dimensions() {
+        let frame = flat_frame(8, 8, 128, 128, 128);
+        assert_eq!(encode_toy(&frame, 0), Err(ToyCodecError::InvalidDimensions));
+    }
+
+    #[test]
+    fn rejects_qp_above_51() {
+        let frame = flat_frame(16, 16, 128, 128, 128);
+        assert_eq!(encode_toy(&frame, 52), Err(ToyCodecError::Unsupported));
+    }
+
+    #[test]
+    fn coefficient_count_matches_pixel_count() {
+        let frame = flat_frame(32, 32, 128, 128, 128);
+        let bs = encode_toy(&frame, 0).unwrap();
+        assert_eq!(bs.coeffs_y.len(), 32 * 32);
+        assert_eq!(bs.coeffs_u.len(), 16 * 16);
+        assert_eq!(bs.coeffs_v.len(), 16 * 16);
     }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "snarkvid-h264-test-vectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Test corpus loader: returns the bytes for each archived .h264 +
+# decoded YUV pair. Used by crates/h264-decoder's regression tests.
+# Does NOT contain the decoder itself.
+
+[dependencies]

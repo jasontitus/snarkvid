@@ -8,6 +8,9 @@ members = [
     "crates/toy-codec",
     "crates/manifest",
     "crates/comparator",
+    "crates/m2-statement",
+    "crates/h264-decoder",
+    "crates/h264-test-vectors",
     "bin/toy-encode",
 ]
 exclude = [
@@ -22,8 +25,12 @@ publish = false
 
 [workspace.dependencies]
 # Shared deps across milestone-2 crates
-serde = { version = "1", default-features = false, features = ["derive"] }
-ed25519-dalek = "2"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# serde's built-in array impls only cover lengths up to 32. We need
+# 64 for Ed25519 signatures and the device_id field; serde-big-array
+# is the canonical no_std-friendly workaround.
+serde-big-array = { version = "0.5", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
 # Poseidon (circuit-friendly hash for Merkle): add when chosen
 # arkworks or Neptune

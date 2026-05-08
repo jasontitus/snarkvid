@@ -13,3 +13,11 @@ path = "src/main.rs"
 snarkvid-toy-codec = { path = "../../crates/toy-codec" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+
+[dev-dependencies]
+# M2 pipeline integration test composes all three native crates.
+snarkvid-comparator = { path = "../../crates/comparator" }
+snarkvid-manifest = { path = "../../crates/manifest" }
+snarkvid-m2-statement = { path = "../../crates/m2-statement" }
+sha2 = "0.10"
+ed25519-dalek.workspace = true

@@ -35,13 +35,15 @@ use alloc::vec::Vec;
 extern crate std;
 
 use sha2::{Digest, Sha256};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use serde_big_array::BigArray;
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /// Body of the manifest — everything the signature covers.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ManifestBody {
     pub version: u8,
     pub video: VideoDescriptor,
@@ -50,7 +52,7 @@ pub struct ManifestBody {
     pub device_id: DeviceId,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VideoDescriptor {
     pub width: u16,
     pub height: u16,
@@ -61,7 +63,7 @@ pub struct VideoDescriptor {
     pub merkle_root: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioDescriptor {
     pub sample_rate: u32,
     pub channels: u8,
@@ -71,20 +73,21 @@ pub struct AudioDescriptor {
 }
 
 /// Device identifier — max 64 bytes, human-readable.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DeviceId(pub [u8; 64]);
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceId(#[serde(with = "BigArray")] pub [u8; 64]);
 
 /// A signed manifest: body + Ed25519 public key + signature.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SignedManifest {
     pub body: ManifestBody,
     pub pubkey: [u8; 32],
+    #[serde(with = "BigArray")]
     pub signature: [u8; 64],
 }
 
 /// A Merkle path proving membership of a leaf at `index` in the tree
 /// identified by `root`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MerklePath {
     pub index: usize,
     pub siblings: Vec<[u8; 32]>,
@@ -94,7 +97,7 @@ pub struct MerklePath {
 // Errors
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ManifestError {
     InvalidSignature,
     InvalidMerkleRoot,
@@ -150,27 +153,35 @@ impl ManifestBody {
 // Signature verification
 // ---------------------------------------------------------------------------
 
-/// Verify an Ed25519 signature over the manifest body.
+/// Sign a manifest body with an Ed25519 signing key. Embeds the
+/// matching public key alongside the signature so verifiers don't
+/// need an out-of-band PKI lookup.
+pub fn sign_manifest(body: ManifestBody, signing_key: &SigningKey) -> SignedManifest {
+    let body_bytes = body.to_bytes();
+    let signature: Signature = signing_key.sign(&body_bytes);
+    SignedManifest {
+        body,
+        pubkey: signing_key.verifying_key().to_bytes(),
+        signature: signature.to_bytes(),
+    }
+}
+
+/// Verify the Ed25519 signature on a manifest. Returns `Ok(())` iff
+/// `manifest.pubkey` signed `manifest.body`. Used by both the host
+/// (sanity check before proving) and the guest (in-circuit assertion
+/// against the public manifest).
 ///
-/// Returns Ok(()) if `pubkey` signed `body`, Err otherwise.
-/// This runs both natively (host) and in-circuit (guest).
-pub fn verify_manifest(
-    manifest: &SignedManifest,
-) -> Result<(), ManifestError> {
+/// Uses `verify_strict`, which rejects malleable encodings of `R` —
+/// this matters because we hash signed bytes elsewhere; a
+/// non-canonical signature on the same body would produce a different
+/// commitment.
+pub fn verify_manifest(manifest: &SignedManifest) -> Result<(), ManifestError> {
     let body_bytes = manifest.body.to_bytes();
-    // Hash the body bytes with SHA-256 before Ed25519 verification.
-    // Ed25519 signs the SHA-512 hash internally, but we pre-hash for
-    // compatibility with the dalek API.
-    let _hash = Sha256::digest(&body_bytes);
-
-    // Milestone 2 day 2: wire actual Ed25519 verification.
-    // ed25519_dalek::VerifyingKey::from_bytes(&manifest.pubkey)
-    //     .and_then(|vk| vk.verify_strict(&body_bytes, &Signature::from_bytes(&manifest.signature)))
-    //     .map_err(|_| ManifestError::InvalidSignature)?;
-
-    // Stub: accept any signature for now (unblock development)
-    let _ = manifest;
-    Ok(())
+    let vk = VerifyingKey::from_bytes(&manifest.pubkey)
+        .map_err(|_| ManifestError::InvalidSignature)?;
+    let sig = Signature::from_bytes(&manifest.signature);
+    vk.verify_strict(&body_bytes, &sig)
+        .map_err(|_| ManifestError::InvalidSignature)
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +222,46 @@ pub fn hash_leaf(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
+/// Build the authentication path for `leaves[index]`. Returns the
+/// siblings the verifier needs to recompute the root, level by level
+/// from the leaf upward. Mirrors `merkle_root`'s "duplicate the last
+/// odd-out node" rule, so every level emitted by `merkle_root`
+/// composes correctly with these paths.
+pub fn merkle_path(leaves: &[[u8; 32]], index: usize) -> Result<MerklePath, ManifestError> {
+    if leaves.is_empty() || index >= leaves.len() {
+        return Err(ManifestError::InvalidPath);
+    }
+    let mut siblings = Vec::new();
+    let mut current_idx = index;
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    while level.len() > 1 {
+        let sibling_idx = if current_idx % 2 == 0 { current_idx + 1 } else { current_idx - 1 };
+        // Odd-length level → last node duplicates itself, so its sibling is itself.
+        let sibling = if sibling_idx < level.len() {
+            level[sibling_idx]
+        } else {
+            level[current_idx]
+        };
+        siblings.push(sibling);
+
+        // Compute the next level the same way merkle_root does.
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        for pair in level.chunks(2) {
+            let mut hasher = Sha256::new();
+            hasher.update(&pair[0]);
+            if pair.len() > 1 {
+                hasher.update(&pair[1]);
+            } else {
+                hasher.update(&pair[0]);
+            }
+            next.push(hasher.finalize().into());
+        }
+        level = next;
+        current_idx /= 2;
+    }
+    Ok(MerklePath { index, siblings })
+}
+
 /// Verify that `leaf` is a member of the Merkle tree with `root`,
 /// given its `path`.
 pub fn verify_merkle_path(
@@ -246,6 +297,28 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    fn fixture_body() -> ManifestBody {
+        ManifestBody {
+            version: 1,
+            video: VideoDescriptor {
+                width: 1280,
+                height: 720,
+                fps_num: 30,
+                fps_den: 1,
+                frame_count: 100,
+                merkle_root: [42u8; 32],
+            },
+            audio: None,
+            created_at: 1_715_000_000,
+            device_id: DeviceId(*b"test-device-0123456789abcdef0123456789abcdef0123456789abcdef0123"),
+        }
+    }
+
+    fn fixture_signing_key() -> SigningKey {
+        // Deterministic key for tests. Real callers use OsRng.
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
     #[test]
     fn merkle_root_single_leaf() {
         let leaf = hash_leaf(b"hello");
@@ -259,19 +332,10 @@ mod tests {
         let b = hash_leaf(b"world");
         let root = merkle_root(&[a, b]);
 
-        // Verify both leaves against root
-        let siblings_a = vec![b];
-        let path_a = MerklePath {
-            index: 0,
-            siblings: siblings_a,
-        };
+        let path_a = MerklePath { index: 0, siblings: vec![b] };
         assert!(verify_merkle_path(&root, &a, &path_a).is_ok());
 
-        let siblings_b = vec![a];
-        let path_b = MerklePath {
-            index: 1,
-            siblings: siblings_b,
-        };
+        let path_b = MerklePath { index: 1, siblings: vec![a] };
         assert!(verify_merkle_path(&root, &b, &path_b).is_ok());
     }
 
@@ -280,10 +344,91 @@ mod tests {
         let a = hash_leaf(b"hello");
         let b = hash_leaf(b"world");
         let root = merkle_root(&[a, b]);
-
         let fake = hash_leaf(b"evil");
-        let siblings = vec![b];
-        let path = MerklePath { index: 0, siblings };
+        let path = MerklePath { index: 0, siblings: vec![b] };
         assert!(verify_merkle_path(&root, &fake, &path).is_err());
+    }
+
+    #[test]
+    fn merkle_path_round_trip_power_of_two() {
+        let leaves: Vec<[u8; 32]> = (0..8).map(|i| hash_leaf(&[i as u8])).collect();
+        let root = merkle_root(&leaves);
+        for (i, leaf) in leaves.iter().enumerate() {
+            let path = merkle_path(&leaves, i).unwrap();
+            assert_eq!(path.siblings.len(), 3, "8-leaf tree → 3-deep path");
+            assert!(
+                verify_merkle_path(&root, leaf, &path).is_ok(),
+                "path[{}] should verify",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn merkle_path_round_trip_odd_length() {
+        // 5 leaves: tree shape forces last-node duplication at multiple levels.
+        let leaves: Vec<[u8; 32]> = (0..5).map(|i| hash_leaf(&[i as u8])).collect();
+        let root = merkle_root(&leaves);
+        for (i, leaf) in leaves.iter().enumerate() {
+            let path = merkle_path(&leaves, i).unwrap();
+            assert!(
+                verify_merkle_path(&root, leaf, &path).is_ok(),
+                "odd-length path[{}] should verify",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn merkle_path_rejects_out_of_range() {
+        let leaves: Vec<[u8; 32]> = (0..4).map(|i| hash_leaf(&[i as u8])).collect();
+        assert_eq!(merkle_path(&leaves, 4), Err(ManifestError::InvalidPath));
+        assert_eq!(merkle_path(&[], 0), Err(ManifestError::InvalidPath));
+    }
+
+    #[test]
+    fn manifest_sign_verify_round_trip() {
+        let key = fixture_signing_key();
+        let signed = sign_manifest(fixture_body(), &key);
+        assert!(verify_manifest(&signed).is_ok());
+    }
+
+    #[test]
+    fn manifest_tampered_body_fails_verify() {
+        // M2 §3.4: flipping a byte in the manifest must fail closed.
+        let key = fixture_signing_key();
+        let mut signed = sign_manifest(fixture_body(), &key);
+        signed.body.video.frame_count += 1;
+        assert_eq!(verify_manifest(&signed), Err(ManifestError::InvalidSignature));
+    }
+
+    #[test]
+    fn manifest_tampered_signature_fails_verify() {
+        let key = fixture_signing_key();
+        let mut signed = sign_manifest(fixture_body(), &key);
+        signed.signature[0] ^= 0xff;
+        assert_eq!(verify_manifest(&signed), Err(ManifestError::InvalidSignature));
+    }
+
+    #[test]
+    fn manifest_unknown_pubkey_fails_verify() {
+        // M2 §3.4: "manifest signed by an unknown key → fails".
+        // Substituting a different (valid) pubkey on a body signed by
+        // someone else must fail — the signature won't match.
+        let known = fixture_signing_key();
+        let attacker = SigningKey::from_bytes(&[0xa5u8; 32]);
+        let mut signed = sign_manifest(fixture_body(), &known);
+        signed.pubkey = attacker.verifying_key().to_bytes();
+        assert_eq!(verify_manifest(&signed), Err(ManifestError::InvalidSignature));
+    }
+
+    #[test]
+    fn manifest_invalid_pubkey_bytes_fails_verify() {
+        let key = fixture_signing_key();
+        let mut signed = sign_manifest(fixture_body(), &key);
+        // ed25519_dalek rejects non-canonical / off-curve points.
+        // All-zeros is the identity element → off-prime-order subgroup.
+        signed.pubkey = [0u8; 32];
+        assert_eq!(verify_manifest(&signed), Err(ManifestError::InvalidSignature));
     }
 }

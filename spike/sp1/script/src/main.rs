@@ -2,12 +2,24 @@
 // bench/run.sh can call them interchangeably.
 //
 // CLI:
-//   sp1-script prove   --input <fixture> --min-size <N> --out proof.bin --commit-out commit.hex
-//   sp1-script verify  --proof proof.bin --commit <hex> --min-size <N>
-//   sp1-script bench   --fixture-dir ../common/bench-fixtures --out bench.json
+//   sp1-script prove   --workload <sha256|toy-decode>
+//                      --input <fixture> --min-size <N>
+//                      --out proof.bin --commit-out commit.hex
+//   sp1-script verify  --workload <...> --proof proof.bin
+//                      --commit <hex> --min-size <N>
+//   sp1-script bench   --workload <...>
+//                      --fixture-dir ../common/bench-fixtures --out bench.json
+//
+// `--workload sha256` (default) keeps the original M1 statement: prove
+// SHA-256 of `data` matches `commitment` and `data.len() >= min_size`.
+//
+// `--workload toy-decode` proves the M1b/M2 toy codec kernel: SHA-256 of
+// `decode_toy(bitstream).{y,u,v}` matches `commitment`. Same statement
+// shape as the Jolt and Sonobe toy-decode workloads, so numbers compare
+// directly across all three systems.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sp1_sdk::prelude::*;
@@ -16,12 +28,22 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// The ELF we want to execute inside the zkVM.
-const ELF: Elf = include_elf!("sha256-preimage");
+use snarkvid_toy_codec::{decode_toy, BqHeader, YuvFrame};
+
+const SHA_ELF: Elf = include_elf!("sha256-preimage");
+const TOY_ELF: Elf = include_elf!("toy-decode");
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Workload {
+    /// M1 statement: SHA-256 preimage of `data`, length >= min_size.
+    Sha256,
+    /// M1b/M2 statement: SHA-256 of decode_toy(bitstream) outputs.
+    ToyDecode,
+}
 
 #[derive(Parser)]
 #[command(name = "sp1-script")]
-#[command(about = "SP1 side of the snarkvid milestone-1 spike")]
+#[command(about = "SP1 side of the snarkvid spike")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -29,39 +51,40 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Prove SHA-256 preimage knowledge
+    /// Prove the chosen workload.
     Prove {
-        /// Input fixture file (private witness)
+        #[arg(long, value_enum, default_value_t = Workload::Sha256)]
+        workload: Workload,
+        /// Input fixture file (private witness).
         #[arg(long)]
         input: PathBuf,
-        /// Minimum size constraint
-        #[arg(long)]
+        /// Minimum size constraint (sha256 only; ignored by toy-decode).
+        #[arg(long, default_value_t = 0)]
         min_size: u32,
-        /// Output proof file
+        /// Output proof file.
         #[arg(long)]
         out: PathBuf,
-        /// Output commitment hex file
+        /// Output commitment hex file.
         #[arg(long)]
         commit_out: Option<PathBuf>,
     },
-    /// Verify a proof
+    /// Verify a proof.
     Verify {
-        /// Proof file
+        #[arg(long, value_enum, default_value_t = Workload::Sha256)]
+        workload: Workload,
         #[arg(long)]
         proof: PathBuf,
-        /// Expected commitment hex
         #[arg(long)]
         commit: String,
-        /// Expected min size
-        #[arg(long)]
+        #[arg(long, default_value_t = 0)]
         min_size: u32,
     },
-    /// Run benchmarks on all fixtures
+    /// Run benchmarks on all fixtures.
     Bench {
-        /// Directory containing fixture files
+        #[arg(long, value_enum, default_value_t = Workload::Sha256)]
+        workload: Workload,
         #[arg(long)]
         fixture_dir: PathBuf,
-        /// Output JSON file
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -108,6 +131,55 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Build a deterministic 16x16 4:2:0 YUV frame from the leading bytes of
+/// `data` (padded with zeros if short). Mirrors the Jolt toy-decode
+/// fixture so SP1 / Jolt / Sonobe numbers compare apples-to-apples.
+fn build_toy_frame(data: &[u8]) -> YuvFrame {
+    let mut buf = data.to_vec();
+    buf.resize(384, 0);
+    YuvFrame {
+        width: 16,
+        height: 16,
+        y: buf[0..256].to_vec(),
+        u: buf[256..320].to_vec(),
+        v: buf[320..384].to_vec(),
+    }
+}
+
+/// Native reference: run encode_toy then decode_toy, hash the decoded
+/// YUV. The guest must produce the same digest.
+fn toy_native_commitment(frame: &YuvFrame) -> Result<[u8; 32]> {
+    let bs = snarkvid_toy_codec::encode_toy(frame, 0)
+        .map_err(|e| anyhow::anyhow!("encode_toy: {:?}", e))?;
+    let decoded = decode_toy(&bs).map_err(|e| anyhow::anyhow!("decode_toy: {:?}", e))?;
+    let mut h = Sha256::new();
+    h.update(&decoded.y);
+    h.update(&decoded.u);
+    h.update(&decoded.v);
+    Ok(h.finalize().into())
+}
+
+/// Write a toy-decode bitstream to SP1 stdin in the same field order
+/// the guest reads it. Keeps host and guest layouts in lockstep.
+fn write_toy_stdin(stdin: &mut SP1Stdin, frame: &YuvFrame) -> Result<()> {
+    let bs = snarkvid_toy_codec::encode_toy(frame, 0)
+        .map_err(|e| anyhow::anyhow!("encode_toy: {:?}", e))?;
+    let BqHeader {
+        width,
+        height,
+        qp,
+        chroma_format,
+    } = bs.header;
+    stdin.write(&width);
+    stdin.write(&height);
+    stdin.write(&qp);
+    stdin.write(&chroma_format);
+    stdin.write(&bs.coeffs_y);
+    stdin.write(&bs.coeffs_u);
+    stdin.write(&bs.coeffs_v);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     sp1_sdk::utils::setup_logger();
@@ -116,202 +188,336 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Prove {
+            workload,
             input,
             min_size,
             out,
             commit_out,
-        } => {
-            let data = std::fs::read(&input).context("failed to read input file")?;
-            let commitment: [u8; 32] = Sha256::digest(&data).into();
-
-            // Write commitment to file if requested
-            if let Some(path) = &commit_out {
-                std::fs::write(path, bytes_to_hex(&commitment))
-                    .context("failed to write commitment")?;
-            }
-
-            let mut stdin = SP1Stdin::new();
-            stdin.write(&min_size);
-            stdin.write(&data);
-
-            let client = ProverClient::from_env().await;
-            let pk = client.setup(ELF).await.context("setup failed")?;
-
-            let t0 = Instant::now();
-            let mut proof = client
-                .prove(&pk, stdin)
-                .core()
-                .await
-                .context("prove failed")?;
-            let prove_ms = t0.elapsed().as_millis() as u64;
-
-            // Read public values from proof
-            let pv_digest: [u8; 32] = proof.public_values.read();
-            let pv_min_size: u32 = proof.public_values.read();
-
-            anyhow::ensure!(
-                pv_digest == commitment,
-                "public value digest mismatch"
-            );
-            anyhow::ensure!(
-                pv_min_size == min_size,
-                "public value min_size mismatch"
-            );
-
-            client
-                .verify(&proof, pk.verifying_key(), None)
-                .context("verification failed")?;
-
-            proof
-                .save(&out)
-                .context("failed to save proof")?;
-
-            println!("proved in {} ms", prove_ms);
-            println!("proof saved to {}", out.display());
-        }
+        } => match workload {
+            Workload::Sha256 => prove_sha256(input, min_size, out, commit_out).await,
+            Workload::ToyDecode => prove_toy_decode(input, out, commit_out).await,
+        },
         Commands::Verify {
+            workload,
             proof,
             commit,
             min_size,
-        } => {
-            let expected_commitment = hex_to_bytes(&commit)?;
-            anyhow::ensure!(
-                expected_commitment.len() == 32,
-                "commitment must be 32 bytes"
-            );
+        } => match workload {
+            Workload::Sha256 => verify_sha256(proof, commit, min_size).await,
+            Workload::ToyDecode => verify_toy_decode(proof, commit).await,
+        },
+        Commands::Bench {
+            workload,
+            fixture_dir,
+            out,
+        } => match workload {
+            Workload::Sha256 => bench_sha256(fixture_dir, out).await,
+            Workload::ToyDecode => bench_toy_decode(fixture_dir, out).await,
+        },
+    }
+}
 
-            let mut proof =
-                SP1ProofWithPublicValues::load(&proof).context("failed to load proof")?;
+// ---------------------------------------------------------------------------
+// SHA-256 workload (M1)
+// ---------------------------------------------------------------------------
 
-            let client = ProverClient::from_env().await;
-            let pk = client.setup(ELF).await.context("setup failed")?;
+async fn prove_sha256(
+    input: PathBuf,
+    min_size: u32,
+    out: PathBuf,
+    commit_out: Option<PathBuf>,
+) -> Result<()> {
+    let data = std::fs::read(&input).context("failed to read input file")?;
+    let commitment: [u8; 32] = Sha256::digest(&data).into();
 
-            let t0 = Instant::now();
-            client
-                .verify(&proof, pk.verifying_key(), None)
-                .context("verification failed")?;
-            let verify_ms = t0.elapsed().as_millis() as u64;
+    if let Some(path) = &commit_out {
+        std::fs::write(path, bytes_to_hex(&commitment)).context("failed to write commitment")?;
+    }
 
-            // Verify public values
-            let pv_digest: [u8; 32] = proof.public_values.read();
-            let pv_min_size: u32 = proof.public_values.read();
+    let mut stdin = SP1Stdin::new();
+    stdin.write(&min_size);
+    stdin.write(&data);
 
-            anyhow::ensure!(
-                pv_digest == *expected_commitment.as_slice(),
-                "digest mismatch"
-            );
-            anyhow::ensure!(
-                pv_min_size == min_size,
-                "min_size mismatch"
-            );
+    let client = ProverClient::from_env().await;
+    let pk = client.setup(SHA_ELF).await.context("setup failed")?;
 
-            println!("verified in {} ms", verify_ms);
+    let t0 = Instant::now();
+    let mut proof = client
+        .prove(&pk, stdin)
+        .core()
+        .await
+        .context("prove failed")?;
+    let prove_ms = t0.elapsed().as_millis() as u64;
+
+    let pv_digest: [u8; 32] = proof.public_values.read();
+    let pv_min_size: u32 = proof.public_values.read();
+    anyhow::ensure!(pv_digest == commitment, "public value digest mismatch");
+    anyhow::ensure!(pv_min_size == min_size, "public value min_size mismatch");
+
+    client
+        .verify(&proof, pk.verifying_key(), None)
+        .context("verification failed")?;
+
+    proof.save(&out).context("failed to save proof")?;
+
+    println!("proved in {} ms", prove_ms);
+    println!("proof saved to {}", out.display());
+    Ok(())
+}
+
+async fn verify_sha256(proof: PathBuf, commit: String, min_size: u32) -> Result<()> {
+    let expected_commitment = hex_to_bytes(&commit)?;
+    anyhow::ensure!(expected_commitment.len() == 32, "commitment must be 32 bytes");
+
+    let mut proof =
+        SP1ProofWithPublicValues::load(&proof).context("failed to load proof")?;
+    let client = ProverClient::from_env().await;
+    let pk = client.setup(SHA_ELF).await.context("setup failed")?;
+
+    let t0 = Instant::now();
+    client
+        .verify(&proof, pk.verifying_key(), None)
+        .context("verification failed")?;
+    let verify_ms = t0.elapsed().as_millis() as u64;
+
+    let pv_digest: [u8; 32] = proof.public_values.read();
+    let pv_min_size: u32 = proof.public_values.read();
+    anyhow::ensure!(pv_digest == *expected_commitment.as_slice(), "digest mismatch");
+    anyhow::ensure!(pv_min_size == min_size, "min_size mismatch");
+
+    println!("verified in {} ms", verify_ms);
+    Ok(())
+}
+
+async fn bench_sha256(fixture_dir: PathBuf, out: Option<PathBuf>) -> Result<()> {
+    let client = ProverClient::from_env().await;
+    let pk = client.setup(SHA_ELF).await.context("setup failed")?;
+
+    let sizes = [("1k", 1024usize), ("1m", 1_048_576), ("10m", 10_485_760)];
+
+    let mut partial = BenchResult {
+        system: "sp1".to_string(),
+        toolchain: format!("sp1-{}", env!("CARGO_PKG_VERSION")),
+        gpu: None,
+        verifier_wasm_gz_bytes: None,
+        verify_browser_ms: None,
+        rows: Vec::new(),
+    };
+
+    for (label, _size) in sizes {
+        let fixture = fixture_dir.join(format!("fixture-{}.bin", label));
+        if !fixture.exists() {
+            eprintln!("skipping {}: not found", fixture.display());
+            continue;
         }
-        Commands::Bench { fixture_dir, out } => {
-            let client = ProverClient::from_env().await;
-            let pk = client.setup(ELF).await.context("setup failed")?;
+        let data = std::fs::read(&fixture).context(format!("read {}", fixture.display()))?;
+        let min_size = data.len() as u32;
+        let mut stdin = SP1Stdin::new();
+        stdin.write(&min_size);
+        stdin.write(&data);
 
-            let sizes = [("1k", 1024), ("1m", 1_048_576), ("10m", 10_485_760)];
+        let (_, report) = client
+            .execute(SHA_ELF, stdin.clone())
+            .await
+            .context("execute failed")?;
 
-            // Re-serialize this after every fixture so a crash mid-run still
-            // leaves the completed rows durable on disk.
-            let mut partial = BenchResult {
-                system: "sp1".to_string(),
-                toolchain: format!("sp1-{}", env!("CARGO_PKG_VERSION")),
-                gpu: None,
-                verifier_wasm_gz_bytes: None,
-                verify_browser_ms: None,
-                rows: Vec::new(),
-            };
+        let t0 = Instant::now();
+        let proof = client
+            .prove(&pk, stdin.clone())
+            .core()
+            .await
+            .context("prove failed")?;
+        let prove_ms = t0.elapsed().as_millis() as u64;
 
-            for (label, _size) in sizes {
-                let fixture = fixture_dir.join(format!("fixture-{}.bin", label));
-                if !fixture.exists() {
-                    eprintln!("skipping {}: not found", fixture.display());
-                    continue;
-                }
+        let t1 = Instant::now();
+        client
+            .verify(&proof, pk.verifying_key(), None)
+            .context("verify failed")?;
+        let verify_ms = t1.elapsed().as_millis() as u64;
 
-                let data = std::fs::read(&fixture).context(format!("read {}", fixture.display()))?;
-                let min_size = data.len() as u32;
+        let proof_path = std::env::temp_dir().join(format!("sp1-bench-{}.bin", label));
+        proof.save(&proof_path).context("save bench proof")?;
+        let proof_bytes = std::fs::metadata(&proof_path)?.len() as usize;
+        let _ = std::fs::remove_file(&proof_path);
 
-                let mut stdin = SP1Stdin::new();
-                stdin.write(&min_size);
-                stdin.write(&data);
+        partial.rows.push(Row {
+            size_label: label.to_string(),
+            size_bytes: data.len(),
+            cycles: report.total_instruction_count(),
+            prove_ms,
+            verify_native_ms: verify_ms,
+            proof_bytes,
+            peak_rss_bytes: get_peak_rss(),
+        });
 
-                // Execute to get cycle count
-                let (_, report) = client
-                    .execute(ELF, stdin.clone())
-                    .await
-                    .context("execute failed")?;
+        println!(
+            "{}: {} cycles, prove {} ms, verify {} ms, proof {} bytes",
+            label,
+            report.total_instruction_count(),
+            prove_ms,
+            verify_ms,
+            proof_bytes
+        );
+        let _ = std::io::stdout().flush();
 
-                // Prove
-                let t0 = Instant::now();
-                let proof = client
-                    .prove(&pk, stdin.clone())
-                    .core()
-                    .await
-                    .context("prove failed")?;
-                let prove_ms = t0.elapsed().as_millis() as u64;
-
-                // Verify
-                let t1 = Instant::now();
-                client
-                    .verify(&proof, pk.verifying_key(), None)
-                    .context("verify failed")?;
-                let verify_ms = t1.elapsed().as_millis() as u64;
-
-                // Proof size — save to temp path and measure file size.
-                // `.bytes()` panics for Core proofs (onchain-only serialization).
-                let proof_path = std::env::temp_dir().join(format!("sp1-bench-{}.bin", label));
-                proof
-                    .save(&proof_path)
-                    .context("failed to save bench proof")?;
-                let proof_bytes = std::fs::metadata(&proof_path)
-                    .context("failed to stat bench proof")?
-                    .len() as usize;
-                let _ = std::fs::remove_file(&proof_path);
-
-                // Peak RSS (approximate from /proc/self/status on Linux)
-                let peak_rss = get_peak_rss();
-
-                partial.rows.push(Row {
-                    size_label: label.to_string(),
-                    size_bytes: data.len(),
-                    cycles: report.total_instruction_count(),
-                    prove_ms,
-                    verify_native_ms: verify_ms,
-                    proof_bytes,
-                    peak_rss_bytes: peak_rss,
-                });
-
-                println!(
-                    "{}: {} cycles, prove {} ms, verify {} ms, proof {} bytes",
-                    label, report.total_instruction_count(), prove_ms, verify_ms, proof_bytes
-                );
-                let _ = std::io::stdout().flush();
-
-                // Persist the partial result after every fixture so a later
-                // crash never erases earlier rows.
-                if let Some(path) = out.as_ref() {
-                    write_partial(path, &partial)
-                        .with_context(|| format!("write partial bench results to {}", path.display()))?;
-                }
-            }
-
-            if let Some(path) = out.as_ref() {
-                println!("wrote {}", path.display());
-            } else {
-                println!("{}", serde_json::to_string_pretty(&partial)?);
-            }
-            let _ = std::io::stdout().flush();
+        if let Some(path) = out.as_ref() {
+            write_partial(path, &partial)?;
         }
     }
 
+    if let Some(path) = out.as_ref() {
+        println!("wrote {}", path.display());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&partial)?);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Toy-decode workload (M1b 3-way parity / M2 codec kernel)
+// ---------------------------------------------------------------------------
+
+async fn prove_toy_decode(
+    input: PathBuf,
+    out: PathBuf,
+    commit_out: Option<PathBuf>,
+) -> Result<()> {
+    let data = std::fs::read(&input).context("failed to read input file")?;
+    let frame = build_toy_frame(&data);
+    let commitment = toy_native_commitment(&frame)?;
+
+    if let Some(path) = &commit_out {
+        std::fs::write(path, bytes_to_hex(&commitment)).context("failed to write commitment")?;
+    }
+
+    let mut stdin = SP1Stdin::new();
+    write_toy_stdin(&mut stdin, &frame)?;
+
+    let client = ProverClient::from_env().await;
+    let pk = client.setup(TOY_ELF).await.context("setup failed")?;
+
+    let t0 = Instant::now();
+    let mut proof = client
+        .prove(&pk, stdin)
+        .core()
+        .await
+        .context("prove failed")?;
+    let prove_ms = t0.elapsed().as_millis() as u64;
+
+    let pv_digest: [u8; 32] = proof.public_values.read();
+    let pv_width: u16 = proof.public_values.read();
+    let pv_height: u16 = proof.public_values.read();
+    anyhow::ensure!(pv_digest == commitment, "digest mismatch (host vs guest)");
+    anyhow::ensure!(pv_width == frame.width, "width mismatch");
+    anyhow::ensure!(pv_height == frame.height, "height mismatch");
+
+    client
+        .verify(&proof, pk.verifying_key(), None)
+        .context("verification failed")?;
+
+    proof.save(&out).context("failed to save proof")?;
+    println!("proved in {} ms", prove_ms);
+    println!("commitment={}", bytes_to_hex(&commitment));
+    Ok(())
+}
+
+async fn verify_toy_decode(proof: PathBuf, commit: String) -> Result<()> {
+    let expected_commitment = hex_to_bytes(&commit)?;
+    anyhow::ensure!(expected_commitment.len() == 32, "commitment must be 32 bytes");
+
+    let mut proof =
+        SP1ProofWithPublicValues::load(&proof).context("failed to load proof")?;
+    let client = ProverClient::from_env().await;
+    let pk = client.setup(TOY_ELF).await.context("setup failed")?;
+
+    let t0 = Instant::now();
+    client
+        .verify(&proof, pk.verifying_key(), None)
+        .context("verification failed")?;
+    let verify_ms = t0.elapsed().as_millis() as u64;
+
+    let pv_digest: [u8; 32] = proof.public_values.read();
+    anyhow::ensure!(
+        pv_digest == *expected_commitment.as_slice(),
+        "digest mismatch"
+    );
+    println!("verified in {} ms", verify_ms);
+    Ok(())
+}
+
+async fn bench_toy_decode(_fixture_dir: PathBuf, out: Option<PathBuf>) -> Result<()> {
+    let client = ProverClient::from_env().await;
+    let pk = client.setup(TOY_ELF).await.context("setup failed")?;
+
+    // Synthetic 16x16 4:2:0 ramp, identical to the Jolt toy-decode bench.
+    let data: Vec<u8> = (0..384).map(|i| (i & 0xff) as u8).collect();
+    let frame = build_toy_frame(&data);
+
+    let mut stdin = SP1Stdin::new();
+    write_toy_stdin(&mut stdin, &frame)?;
+
+    let (_, report) = client
+        .execute(TOY_ELF, stdin.clone())
+        .await
+        .context("execute failed")?;
+
+    let t0 = Instant::now();
+    let proof = client
+        .prove(&pk, stdin.clone())
+        .core()
+        .await
+        .context("prove failed")?;
+    let prove_ms = t0.elapsed().as_millis() as u64;
+
+    let t1 = Instant::now();
+    client
+        .verify(&proof, pk.verifying_key(), None)
+        .context("verify failed")?;
+    let verify_ms = t1.elapsed().as_millis() as u64;
+
+    let proof_path = std::env::temp_dir().join("sp1-bench-toy-decode.bin");
+    proof.save(&proof_path).context("save bench proof")?;
+    let proof_bytes = std::fs::metadata(&proof_path)?.len() as usize;
+    let _ = std::fs::remove_file(&proof_path);
+
+    let row = Row {
+        size_label: "16x16".to_string(),
+        size_bytes: 384,
+        cycles: report.total_instruction_count(),
+        prove_ms,
+        verify_native_ms: verify_ms,
+        proof_bytes,
+        peak_rss_bytes: get_peak_rss(),
+    };
+
+    let result = BenchResult {
+        system: "sp1-toy-decode".to_string(),
+        toolchain: format!("sp1-{}", env!("CARGO_PKG_VERSION")),
+        gpu: None,
+        verifier_wasm_gz_bytes: None,
+        verify_browser_ms: None,
+        rows: vec![row],
+    };
+
+    println!(
+        "16x16: {} cycles, prove {} ms, verify {} ms, proof {} bytes",
+        report.total_instruction_count(),
+        prove_ms,
+        verify_ms,
+        proof_bytes
+    );
+    let _ = std::io::stdout().flush();
+
+    if let Some(path) = out {
+        write_partial(&path, &result)?;
+        println!("wrote {}", path.display());
+    } else {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
     Ok(())
 }
 
 fn get_peak_rss() -> usize {
-    // Read Peak RSS from /proc/self/status on Linux
     if let Ok(content) = std::fs::read_to_string("/proc/self/status") {
         for line in content.lines() {
             if line.starts_with("VmHWM:") {
@@ -327,9 +533,6 @@ fn get_peak_rss() -> usize {
     0
 }
 
-/// Atomically write `result` as JSON to `path`. Writes to `<path>.tmp`, fsyncs,
-/// then renames into place — so a crash mid-run never leaves a half-file, and
-/// the latest fully-completed row is always durable on disk.
 fn write_partial(path: &Path, result: &BenchResult) -> Result<()> {
     let json = serde_json::to_string_pretty(result)?;
     let tmp = path.with_extension("json.tmp");

@@ -1,0 +1,27 @@
+[package]
+name = "snarkvid-h264-decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The H.264 decoder crate. Heart of milestone 3.
+#
+# no_std so the same code runs natively (CLI, tests, host) and inside
+# the zkVM guest. Scope per milestones/03-h264-iframe.md §2: baseline
+# profile, single IDR slice, single slice per frame, 4:2:0 8-bit, all
+# 9 Intra_4x4 modes, all 4 Intra_16x16 modes, all 4 chroma 8x8 modes,
+# I_PCM, CAVLC entropy decode, 4x4 integer IDCT + DC Hadamard.
+#
+# Out of scope: P-frames, B-frames, CABAC, deblocking, multi-slice.
+
+[features]
+default = ["std"]
+# `std` enables Display/Error impls on the error types so anyhow can
+# wrap them. The guest compiles without it.
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+snarkvid-h264-test-vectors = { path = "../h264-test-vectors" }
