@@ -27,6 +27,7 @@
 extern crate alloc;
 
 pub mod bitreader;
+pub mod cavlc;
 pub mod nal;
 
 /// Errors that can occur during H.264 decoding.
