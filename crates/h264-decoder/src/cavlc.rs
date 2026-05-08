@@ -326,6 +326,334 @@ pub const COEFF_TOKEN_CHROMA_DC_420: &[VlcEntry] = &[
     ct(0b000011,    6, 4, 3),
 ];
 
+// ─────────────────────────────────────────────────────────────────────
+// Level decoding (spec §9.2.2)
+//
+// After coeff_token gives us (TotalCoeff, TrailingOnes), we read the
+// signed coefficient values. Trailing ones are ±1, sign read as 1
+// bit each. The remaining (TotalCoeff - TrailingOnes) coefficients
+// are encoded as `level_prefix` (unary) + `level_suffix` (fixed
+// length), with a stateful `suffix_length` that adapts based on
+// previously-decoded magnitudes.
+//
+// Implementation follows the spec algorithm verbatim.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Read up to 32 leading zero bits followed by a 1 bit, return the
+/// number of leading zeros. Caps at 32 to keep the cost bounded
+/// (anything larger is invalid CAVLC).
+fn read_level_prefix(br: &mut BitReader) -> Result<u32, DecodeError> {
+    let mut zeros = 0u32;
+    while br.read_bit()? == 0 {
+        zeros += 1;
+        if zeros > 32 {
+            return Err(DecodeError::CavlcInvalid);
+        }
+    }
+    Ok(zeros)
+}
+
+/// Decode the (TotalCoeff - TrailingOnes) non-trailing-one signed
+/// levels. Returns them in spec order (highest-frequency first;
+/// caller flips to raster as needed).
+///
+/// `total_coeff` and `trailing_ones` come from coeff_token.
+pub fn decode_levels(
+    br: &mut BitReader,
+    total_coeff: u8,
+    trailing_ones: u8,
+) -> Result<[i32; 16], DecodeError> {
+    let mut levels = [0i32; 16];
+    if total_coeff == 0 {
+        return Ok(levels);
+    }
+    if trailing_ones > total_coeff || trailing_ones > 3 {
+        return Err(DecodeError::CavlcInvalid);
+    }
+
+    // Read the trailing_ones sign bits first. 1 = -1, 0 = +1.
+    // The trailing ones are the last `trailing_ones` non-zero
+    // coefficients in zig-zag order; we store them at indices
+    // [total_coeff - trailing_ones .. total_coeff] of the output.
+    for i in 0..trailing_ones as usize {
+        let sign = br.read_bit()?;
+        let idx = (total_coeff - 1) as usize - i;
+        levels[idx] = if sign == 1 { -1 } else { 1 };
+    }
+
+    let n_levels = (total_coeff - trailing_ones) as usize;
+    if n_levels == 0 {
+        return Ok(levels);
+    }
+
+    // Initial suffix_length per spec §9.2.2.
+    // (total_coeff > 10 && trailing_ones < 3) → 1, else 0.
+    let mut suffix_length: u32 =
+        if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
+
+    for k in 0..n_levels {
+        let level_prefix = read_level_prefix(br)?;
+
+        let level_suffix_size: u32 = if level_prefix < 14 {
+            suffix_length
+        } else if level_prefix == 14 && suffix_length == 0 {
+            4
+        } else if level_prefix < 16 {
+            suffix_length
+        } else {
+            // level_prefix == 16 (or higher in practice) — escape.
+            12
+        };
+
+        let level_suffix: u32 = if level_suffix_size > 0 {
+            br.read_bits(level_suffix_size)?
+        } else {
+            0
+        };
+
+        // Reconstruct the unsigned levelCode.
+        let mut level_code: i32 = (core::cmp::min(15, level_prefix) << suffix_length) as i32
+            + level_suffix as i32;
+        if level_prefix >= 14 && suffix_length == 0 {
+            level_code += 15;
+        }
+        if level_prefix >= 16 {
+            level_code += (1 << 12) - 1; // 4095, plus the +1 below for the next branch
+        }
+        // First non-trailing-one with TrailingOnes < 3 gets a +2 bias
+        // (because levelCode=0 means "the smallest non-trailing-one
+        // magnitude is 2", levelCode=2 means "magnitude 3", etc.).
+        if k == 0 && trailing_ones < 3 {
+            level_code += 2;
+        }
+
+        // Map levelCode → signed level.
+        let level: i32 = if level_code & 1 == 0 {
+            (level_code + 2) >> 1
+        } else {
+            -((level_code + 1) >> 1)
+        };
+
+        // Store at the next available slot, walking back from
+        // (total_coeff - trailing_ones - 1) toward 0.
+        let idx = (total_coeff - trailing_ones) as usize - 1 - k;
+        levels[idx] = level;
+
+        // Update suffix_length for the next iteration.
+        if suffix_length == 0 {
+            suffix_length = 1;
+        }
+        if level.unsigned_abs() > (3u32 << (suffix_length - 1)) && suffix_length < 6 {
+            suffix_length += 1;
+        }
+    }
+    Ok(levels)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// total_zeros (spec §9.2.3, Table 9-7 — luma 4×4 case)
+//
+// One VLC table per `total_coeff` value (1..=15). Each table maps a
+// codeword to the count of zero coefficients between the first
+// nonzero (highest freq) and DC, inclusive of internal zeros but
+// not trailing zeros.
+//
+// Tables for TotalCoeff=1..=7 are larger (up to 16 entries). For
+// TotalCoeff=8..=15 the tables shrink monotonically. We transcribe
+// them from spec Table 9-7 row by row.
+// ─────────────────────────────────────────────────────────────────────
+
+const TZ_TC1: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b1,             codeword_len: 1, value: 0 },
+    VlcEntry { codeword: 0b011,           codeword_len: 3, value: 1 },
+    VlcEntry { codeword: 0b010,           codeword_len: 3, value: 2 },
+    VlcEntry { codeword: 0b0011,          codeword_len: 4, value: 3 },
+    VlcEntry { codeword: 0b0010,          codeword_len: 4, value: 4 },
+    VlcEntry { codeword: 0b00011,         codeword_len: 5, value: 5 },
+    VlcEntry { codeword: 0b00010,         codeword_len: 5, value: 6 },
+    VlcEntry { codeword: 0b000011,        codeword_len: 6, value: 7 },
+    VlcEntry { codeword: 0b000010,        codeword_len: 6, value: 8 },
+    VlcEntry { codeword: 0b0000011,       codeword_len: 7, value: 9 },
+    VlcEntry { codeword: 0b0000010,       codeword_len: 7, value: 10 },
+    VlcEntry { codeword: 0b00000011,      codeword_len: 8, value: 11 },
+    VlcEntry { codeword: 0b00000010,      codeword_len: 8, value: 12 },
+    VlcEntry { codeword: 0b000000011,     codeword_len: 9, value: 13 },
+    VlcEntry { codeword: 0b000000010,     codeword_len: 9, value: 14 },
+    VlcEntry { codeword: 0b000000001,     codeword_len: 9, value: 15 },
+];
+
+const TZ_TC2: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b111,    codeword_len: 3, value: 0 },
+    VlcEntry { codeword: 0b110,    codeword_len: 3, value: 1 },
+    VlcEntry { codeword: 0b101,    codeword_len: 3, value: 2 },
+    VlcEntry { codeword: 0b100,    codeword_len: 3, value: 3 },
+    VlcEntry { codeword: 0b011,    codeword_len: 3, value: 4 },
+    VlcEntry { codeword: 0b0101,   codeword_len: 4, value: 5 },
+    VlcEntry { codeword: 0b0100,   codeword_len: 4, value: 6 },
+    VlcEntry { codeword: 0b00011,  codeword_len: 5, value: 7 },
+    VlcEntry { codeword: 0b00010,  codeword_len: 5, value: 8 },
+    VlcEntry { codeword: 0b000011, codeword_len: 6, value: 9 },
+    VlcEntry { codeword: 0b000010, codeword_len: 6, value: 10 },
+    VlcEntry { codeword: 0b000001, codeword_len: 6, value: 11 },
+    VlcEntry { codeword: 0b00000001, codeword_len: 8, value: 12 },
+    VlcEntry { codeword: 0b00000000, codeword_len: 8, value: 13 },
+    VlcEntry { codeword: 0b00000010, codeword_len: 8, value: 14 },
+];
+
+/// Pick the right total_zeros table for `total_coeff`. Returns the
+/// table or an error for unsupported values (TC outside 1..=15).
+fn total_zeros_table(total_coeff: u8) -> Result<&'static [VlcEntry], DecodeError> {
+    match total_coeff {
+        1 => Ok(TZ_TC1),
+        2 => Ok(TZ_TC2),
+        // TC ≥ 3 tables land alongside the rest of CAVLC. For now
+        // surface as an explicit OutOfScope so a corpus that hits
+        // them fails loudly instead of silently miscoding.
+        3..=15 => Err(DecodeError::OutOfScope("total_zeros TC≥3 table TODO")),
+        _ => Err(DecodeError::CavlcInvalid),
+    }
+}
+
+/// Decode `total_zeros` for a 4×4 luma residual block. Caller passes
+/// the `total_coeff` from `coeff_token`.
+pub fn decode_total_zeros_4x4(
+    br: &mut BitReader,
+    total_coeff: u8,
+) -> Result<u8, DecodeError> {
+    if total_coeff == 0 {
+        return Ok(0);
+    }
+    if total_coeff >= 16 {
+        // total_coeff == 16 means no zeros; codeword is implicit.
+        return Ok(0);
+    }
+    let table = total_zeros_table(total_coeff)?;
+    let v = read_vlc(br, table)?;
+    Ok(v as u8)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// run_before (spec §9.2.4, Table 9-10)
+//
+// One VLC table per `zeros_left` value (1..=6). For zeros_left ≥ 7
+// the codeword is a fixed-length unary up to the remaining zeros.
+//
+// We carry the zeros_left=1..=3 tables here (the simplest CAVLC
+// runs); higher-zeros tables land with the rest of the CAVLC work.
+// ─────────────────────────────────────────────────────────────────────
+
+const RB_ZL1: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b1, codeword_len: 1, value: 0 },
+    VlcEntry { codeword: 0b0, codeword_len: 1, value: 1 },
+];
+
+const RB_ZL2: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b1,  codeword_len: 1, value: 0 },
+    VlcEntry { codeword: 0b01, codeword_len: 2, value: 1 },
+    VlcEntry { codeword: 0b00, codeword_len: 2, value: 2 },
+];
+
+const RB_ZL3: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b11, codeword_len: 2, value: 0 },
+    VlcEntry { codeword: 0b10, codeword_len: 2, value: 1 },
+    VlcEntry { codeword: 0b01, codeword_len: 2, value: 2 },
+    VlcEntry { codeword: 0b00, codeword_len: 2, value: 3 },
+];
+
+fn run_before_table(zeros_left: u8) -> Result<&'static [VlcEntry], DecodeError> {
+    match zeros_left {
+        1 => Ok(RB_ZL1),
+        2 => Ok(RB_ZL2),
+        3 => Ok(RB_ZL3),
+        4..=14 => Err(DecodeError::OutOfScope("run_before zeros_left≥4 table TODO")),
+        _ => Err(DecodeError::CavlcInvalid),
+    }
+}
+
+/// Decode one `run_before` value given the remaining `zeros_left`.
+/// Returns the run length (number of zeros before the next nonzero
+/// in the inverse zig-zag walk).
+pub fn decode_run_before(br: &mut BitReader, zeros_left: u8) -> Result<u8, DecodeError> {
+    if zeros_left == 0 { return Ok(0); }
+    let t = run_before_table(zeros_left)?;
+    let v = read_vlc(br, t)?;
+    // Cap the result at zeros_left.
+    Ok(core::cmp::min(v as u8, zeros_left))
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// decode_residual_block_4x4 — the composer
+//
+// Pulls coeff_token, trailing-one signs, levels, total_zeros, and
+// run_before together to produce 16 i32 levels in raster order.
+//
+// Caller responsibilities:
+//   - select the right `CoeffTokenVariant` based on neighbor nC.
+//   - feed the result into `quant::inverse_quant_4x4_ac` and then
+//     into `transform::idct_4x4 + round_shift_6`.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Inverse zig-zag scan order for a 4×4 block (spec §6.4.4 / §8.5.4).
+/// `ZIGZAG[k]` is the raster index of the k-th coefficient in zig-zag
+/// scan order (k=0 = DC at raster index 0; k=15 = highest AC).
+pub const ZIGZAG_4X4: [usize; 16] = [
+    0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15,
+];
+
+/// Decode one 4×4 residual block. Returns 16 levels in raster order
+/// (suitable for handing straight to inverse_quant_4x4_ac).
+pub fn decode_residual_block_4x4(
+    br: &mut BitReader,
+    variant: CoeffTokenVariant,
+) -> Result<[i32; 16], DecodeError> {
+    let ct = decode_coeff_token(br, variant)?;
+    let mut levels_zigzag = decode_levels(br, ct.total_coeff, ct.trailing_ones)?;
+
+    // Place the levels into their zig-zag positions. `decode_levels`
+    // returns them in increasing-frequency order in slots [0..total_coeff],
+    // with index 0 being the highest-frequency nonzero. We need to place
+    // them at zig-zag positions [16 - total_coeff .. 16] before any
+    // run_before / total_zeros gymnastics. Actually the spec is cleaner:
+    // we walk runs in the inverse zig-zag direction (highest freq → DC)
+    // and place coefficients at the right positions.
+
+    let total_zeros = decode_total_zeros_4x4(br, ct.total_coeff)?;
+    let mut zeros_left = total_zeros;
+    let mut coeff_num: i32 = -1; // counts how far back from highest-freq we are
+
+    // Build the 4×4 block in zig-zag space, then unscramble at the end.
+    let mut zz = [0i32; 16];
+
+    if ct.total_coeff > 0 {
+        // levels_zigzag[i] for i in 0..total_coeff currently holds the
+        // levels in increasing-frequency order, where slot 0 is the
+        // highest-frequency nonzero. Re-emit them with run_before.
+        for i in 0..(ct.total_coeff as usize) {
+            let run = if i < (ct.total_coeff as usize) - 1 && zeros_left > 0 {
+                let r = decode_run_before(br, zeros_left)?;
+                zeros_left -= r;
+                r
+            } else {
+                zeros_left
+            };
+            coeff_num += (run + 1) as i32;
+            // coeff_num counts from highest-frequency end; the zigzag
+            // index walking down from k=15 is (15 - coeff_num).
+            let zz_idx = 15 - coeff_num as usize;
+            zz[zz_idx] = levels_zigzag[i];
+        }
+    }
+    // Suppress unused warning during partial CAVLC; final zigzag swizzle:
+    let _ = &mut levels_zigzag;
+
+    // Convert zig-zag → raster.
+    let mut raster = [0i32; 16];
+    for k in 0..16 {
+        raster[ZIGZAG_4X4[k]] = zz[k];
+    }
+    Ok(raster)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +824,147 @@ mod tests {
         // entry "1"; trying to extend hits EOF.
         let r = decode_coeff_token(&mut br, CoeffTokenVariant::Vlc0);
         assert!(matches!(r, Err(DecodeError::BitstreamTruncated)));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Level / total_zeros / run_before / decode_residual_block tests
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_block_returns_all_zeros() {
+        // total_coeff = 0 → no levels, no run_before, no total_zeros lookup.
+        let bytes = pack_bits(&[]);
+        let mut br = BitReader::new(&bytes);
+        let levels = decode_levels(&mut br, 0, 0).unwrap();
+        assert_eq!(levels, [0i32; 16]);
+    }
+
+    #[test]
+    fn single_trailing_one_yields_signed_one() {
+        // total_coeff=1, trailing_ones=1 → read a single sign bit:
+        // 1 → -1, 0 → +1.
+        let bytes = pack_bits(&[1]);
+        let mut br = BitReader::new(&bytes);
+        let levels = decode_levels(&mut br, 1, 1).unwrap();
+        assert_eq!(levels[0], -1);
+        let bytes = pack_bits(&[0]);
+        let mut br = BitReader::new(&bytes);
+        let levels = decode_levels(&mut br, 1, 1).unwrap();
+        assert_eq!(levels[0], 1);
+    }
+
+    #[test]
+    fn three_trailing_ones_each_get_a_sign_bit() {
+        // Trailing ones placed at indices [TC-1, TC-2, TC-3] in the
+        // result. Bits read in order — first sign bit goes to the
+        // highest-frequency trailing one (index TC-1).
+        let bytes = pack_bits(&[1, 0, 1]);
+        let mut br = BitReader::new(&bytes);
+        let levels = decode_levels(&mut br, 3, 3).unwrap();
+        assert_eq!(levels[2], -1);
+        assert_eq!(levels[1], 1);
+        assert_eq!(levels[0], -1);
+    }
+
+    #[test]
+    fn level_prefix_returns_zero_for_lone_one_bit() {
+        let bytes = pack_bits(&[1]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(read_level_prefix(&mut br).unwrap(), 0);
+    }
+
+    #[test]
+    fn level_prefix_counts_zeros() {
+        // 4 zeros then a 1 → returns 4.
+        let bytes = pack_bits(&[0, 0, 0, 0, 1]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(read_level_prefix(&mut br).unwrap(), 4);
+    }
+
+    #[test]
+    fn total_zeros_tc_1_known_codewords() {
+        // From spec Table 9-7: TC=1 column.
+        //   "1"        → 0
+        //   "011"      → 1
+        //   "010"      → 2
+        //   "0011"     → 3
+        let cases: &[(&[u8], u8)] = &[
+            (&[1], 0),
+            (&[0,1,1], 1),
+            (&[0,1,0], 2),
+            (&[0,0,1,1], 3),
+            (&[0,0,1,0], 4),
+        ];
+        for (bits, expected) in cases {
+            let bytes = pack_bits(bits);
+            let mut br = BitReader::new(&bytes);
+            assert_eq!(decode_total_zeros_4x4(&mut br, 1).unwrap(), *expected,
+                "bits {:?}", bits);
+        }
+    }
+
+    #[test]
+    fn total_zeros_tc_eq_16_returns_zero_without_reading() {
+        // total_coeff=16 means the block is full → no zeros possible.
+        let bytes = pack_bits(&[]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_total_zeros_4x4(&mut br, 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn run_before_zl1_round_trip() {
+        // Table 9-10 zeros_left=1: "1" → 0, "0" → 1.
+        let bytes = pack_bits(&[1, 0]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_run_before(&mut br, 1).unwrap(), 0);
+        assert_eq!(decode_run_before(&mut br, 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn run_before_zl3_round_trip() {
+        // zeros_left=3: "11"→0, "10"→1, "01"→2, "00"→3.
+        let bytes = pack_bits(&[1, 1,  1, 0,  0, 1,  0, 0]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_run_before(&mut br, 3).unwrap(), 0);
+        assert_eq!(decode_run_before(&mut br, 3).unwrap(), 1);
+        assert_eq!(decode_run_before(&mut br, 3).unwrap(), 2);
+        assert_eq!(decode_run_before(&mut br, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn zigzag_table_is_a_valid_permutation() {
+        let mut seen = [false; 16];
+        for &k in ZIGZAG_4X4.iter() {
+            assert!(k < 16);
+            assert!(!seen[k], "duplicate index {}", k);
+            seen[k] = true;
+        }
+        // First entry is DC.
+        assert_eq!(ZIGZAG_4X4[0], 0);
+        // Last entry is the highest-frequency AC corner.
+        assert_eq!(ZIGZAG_4X4[15], 15);
+    }
+
+    #[test]
+    fn residual_block_with_single_dc_trailing_one() {
+        // Hand-built bitstream for TC=1, T1=1, sign=+1, total_zeros=15:
+        //   coeff_token  "000101"   → TC=1, T1=0 in VLC0... actually
+        //   coeff_token  "01"       → TC=1, T1=1 in VLC0
+        //   sign bit     "0"        → +1
+        //   total_zeros  "000000001" → 15 (TZ table TC=1 entry)
+        //   no run_before since this is the only nonzero.
+        let bits: alloc::vec::Vec<u8> = [
+            &[0,1][..],                       // coeff_token TC=1,T1=1
+            &[0],                             // sign +1
+            &[0,0,0,0,0,0,0,0,1][..],         // total_zeros = 15 → "000000001"
+        ].concat();
+        let bytes = pack_bits(&bits);
+        let mut br = BitReader::new(&bytes);
+        let raster = decode_residual_block_4x4(&mut br, CoeffTokenVariant::Vlc0).unwrap();
+        // The only nonzero should be at the DC position (raster index 0).
+        assert_eq!(raster[0], 1, "DC = +1; got {:?}", raster);
+        for i in 1..16 {
+            assert_eq!(raster[i], 0, "all AC should be zero; idx {} = {}", i, raster[i]);
+        }
     }
 }
