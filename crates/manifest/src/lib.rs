@@ -36,13 +36,14 @@ extern crate std;
 
 use sha2::{Digest, Sha256};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use serde_big_array::BigArray;
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 /// Body of the manifest — everything the signature covers.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ManifestBody {
     pub version: u8,
     pub video: VideoDescriptor,
@@ -51,7 +52,7 @@ pub struct ManifestBody {
     pub device_id: DeviceId,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VideoDescriptor {
     pub width: u16,
     pub height: u16,
@@ -62,7 +63,7 @@ pub struct VideoDescriptor {
     pub merkle_root: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioDescriptor {
     pub sample_rate: u32,
     pub channels: u8,
@@ -72,20 +73,21 @@ pub struct AudioDescriptor {
 }
 
 /// Device identifier — max 64 bytes, human-readable.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DeviceId(pub [u8; 64]);
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceId(#[serde(with = "BigArray")] pub [u8; 64]);
 
 /// A signed manifest: body + Ed25519 public key + signature.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SignedManifest {
     pub body: ManifestBody,
     pub pubkey: [u8; 32],
+    #[serde(with = "BigArray")]
     pub signature: [u8; 64],
 }
 
 /// A Merkle path proving membership of a leaf at `index` in the tree
 /// identified by `root`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MerklePath {
     pub index: usize,
     pub siblings: Vec<[u8; 32]>,
@@ -95,7 +97,7 @@ pub struct MerklePath {
 // Errors
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ManifestError {
     InvalidSignature,
     InvalidMerkleRoot,

@@ -22,7 +22,11 @@
 #   7. Sonobe IVC    SHA-256 chain + toy-decode; CPU-only
 #   8. Sonobe Decider  Groth16 wrap on top of IVC accumulator (load-bearing
 #                    browser-verifier evidence; OOM'd in the 15 GiB sandbox)
-#   9. Summary       PASS/FAIL line per phase, plus consolidated JSON tree
+#  10. M2 prover    SP1 prove of the full M2 statement (manifest + Merkle +
+#                    decode_toy + PSNR comparator) on a synthetic 32x32 noise
+#                    frame at qp=8 / 36 dB tolerance. Requires sp1up +
+#                    +succinct toolchain installed by phase 2.
+#  11. Summary      PASS/FAIL line per phase, plus consolidated JSON tree
 #
 # The script prints PHASE markers and a final summary block, so it's easy
 # to scrape exit status from the tail of the log.
@@ -248,7 +252,57 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────
-# 9. Summary
+# 10. M2 prover (full statement: manifest + Merkle + decode + PSNR)
+#     The smoke subcommand always runs (works in sandbox); the prove
+#     subcommand needs --features build-guest, which triggers sp1_build
+#     to cross-compile the SP1 guest. Requires sp1up + +succinct from
+#     phase 2.
+# ─────────────────────────────────────────────────────────────────────
+phase_start "10-m2-prover"
+M2_OK=1
+# Synthesize a 32x32 noise frame fixture (xorshift, deterministic).
+mkdir -p "$RESULTS"
+python3 - <<'PYEOF' > "$RESULTS/m2-fixture-32x32.yuv" || M2_OK=0
+import sys
+state = 0xfeedbeef
+def xs():
+    global state
+    state ^= (state << 13) & 0xffffffff
+    state ^= state >> 17
+    state ^= (state << 5) & 0xffffffff
+    return state & 0xff
+sys.stdout.buffer.write(bytes(xs() for _ in range(1536)))
+PYEOF
+
+if [[ "$M2_OK" -eq 1 ]]; then
+    (cd prover && cargo build --release --features build-guest) || M2_OK=0
+fi
+
+# Always-on: smoke subcommand. Validates the M2 statement natively
+# without needing the SP1 guest ELF — should always pass once the
+# fixture exists.
+if [[ "$M2_OK" -eq 1 ]]; then
+    prover/target/release/prover-host smoke \
+        --input "$RESULTS/m2-fixture-32x32.yuv" \
+        --width 32 --height 32 --qp 8 --tolerance 36.0 || M2_OK=0
+fi
+
+# GPU-only: prove subcommand (requires the guest ELF cross-compile above).
+if [[ "$M2_OK" -eq 1 ]]; then
+    prover/target/release/prover-host prove \
+        --input "$RESULTS/m2-fixture-32x32.yuv" \
+        --width 32 --height 32 --qp 8 --tolerance 36.0 \
+        --out "$RESULTS/m2-proof.bin" || M2_OK=0
+fi
+
+if [[ "$M2_OK" -eq 1 ]]; then
+    phase_pass "10-m2-prover" "M2 proof at $RESULTS/m2-proof.bin ($(stat -c %s "$RESULTS/m2-proof.bin" 2>/dev/null || echo ?) B)"
+else
+    phase_fail "10-m2-prover" "M2 prove pipeline failed (build/smoke/prove)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────
+# 11. Summary
 # ─────────────────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════════════"

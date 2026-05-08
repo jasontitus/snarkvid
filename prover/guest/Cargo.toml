@@ -1,0 +1,19 @@
+[package]
+name = "snarkvid-prover-guest"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "snarkvid-prover-guest"
+path = "src/main.rs"
+
+[dependencies]
+sp1-zkvm = "6.1.0"
+
+# M2 statement and friends, by relative path. m2-statement is no_std-pure
+# (and pulls in toy-codec, manifest, comparator with default features off
+# so they all compile for the SP1 RISC-V target).
+snarkvid-m2-statement = { path = "../../crates/m2-statement", default-features = false }
+snarkvid-toy-codec    = { path = "../../crates/toy-codec",    default-features = false }
+snarkvid-manifest     = { path = "../../crates/manifest",     default-features = false }
+snarkvid-comparator   = { path = "../../crates/comparator",   default-features = false }

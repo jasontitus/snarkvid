@@ -28,6 +28,7 @@ whose numbers are already in this repo.
 | **`crates/m2-statement`** | 4 unit tests for the canonical `verify_m2_claim` function (the one the SP1 guest will call in-circuit): happy path, manifest sig failure → typed error, Merkle path failure carries the failing block index, PSNR below tolerance returns the actual measured PSNR. Crate is no_std-pure (`cargo build --no-default-features` clean). | PASS | `cargo test -p snarkvid-m2-statement` |
 | `bin/toy-encode` | Compiles + smoke-encodes a YUV file | PASS | builds clean as part of workspace |
 | **M2 native pipeline** (`bin/toy-encode/tests/m2_pipeline.rs`) | 7 integration tests composing the full fixture builder around `verify_m2_claim`: qp=0 happy-path at 60 dB, qp=8 happy-path at 36 dB, the three §3.4 tampering modes that don't need a prover (compressed bit-flip; manifest signed by unknown key; tolerance below actual PSNR), corrupted Merkle path, path-count mismatch | PASS | `cargo test -p toy-encode --test m2_pipeline` |
+| **`prover/host` smoke** | Runs `prover-host smoke --input frame.yuv --width 32 --height 32 --qp 8 --tolerance 36.0` end-to-end: reads YUV, builds Merkle tree, signs manifest, encodes, calls `verify_m2_claim`. Confirmed PASS at qp=8/36 dB on a noise frame (PSNR Y=57 dB, combined=58 dB). Fail-closed confirmed at qp=32/60 dB (PSNR=46.65 dB rejected). | PASS | `cargo build --manifest-path prover/Cargo.toml --release && prover/target/release/prover-host smoke ...` |
 | Jolt SHA-256 1KB | CPU prove + verify round-trip, cycles + proof bytes captured | PASS — 53,032 cycles / 80,281 B / 4,031 ms prove / 120 ms verify | `spike/bench/results/jolt-sha256.json` |
 | Jolt toy-decode 16×16 | CPU prove + verify with real WHT decoder in the loop | PASS — 108,816 cycles / 83,817 B / 5,962 ms prove / 132 ms verify | `spike/bench/results/jolt-toy-decode.json` |
 | Sonobe Nova SHA-256 chain | CPU IVC bench, several fold counts | PASS (numbers in `01b-newer-frameworks.md` §4) | `spike/bench/results/sonobe-sha256.json` |
@@ -48,6 +49,7 @@ covered by `scripts/full_test_gpu.sh`.
 | 6 | Jolt SHA-256 1MB / 10MB | CPU-only; sandbox can't budget the wall-clock for the bigger fixtures | `bench_jolt.sh` |
 | 7 | Sonobe Nova at higher step counts (`--max-steps 1024`) | Each fold step is ~650 ms; >1k steps wasn't worth burning sandbox minutes on | `bench_sonobe.sh` |
 | **8** | **Sonobe Decider (Groth16 wrap → ~200 B proof)** | **OOM'd in the 15 GiB sandbox at anon-rss = 16 GB during Groth16 setup over the Nova augmented circuit. Code is committed and ready (`sonobe-script bench --decider`).** | needs ≥ 32 GB RAM (Lambda A10 default is fine) |
+| **10** | **M2 prover (`prover-host prove`)** | **The full M2 statement (manifest + Merkle + decode_toy + PSNR) inside an SP1 guest. Requires `--features build-guest` which triggers `sp1_build` to cross-compile the RISC-V guest — needs sp1up + +succinct, GitHub-blocked from sandbox.** Smoke subcommand runs natively on CPU and was confirmed green here. | first build on the GPU box cross-compiles the new `prover/guest/` |
 
 ## What's NOT yet wired up anywhere (known gaps)
 
@@ -59,7 +61,7 @@ nothing to run yet. Tracking here so they don't get lost.
 | Browser verifier (Sonobe Decider) | `spike/web/` exists for SP1 but not yet for the Decider's Groth16/BN254 proof | M2 §3.3 acceptance ("verify in a browser, < 2 s") not yet exercised. Blocked by phase 8 producing a Decider proof on disk. |
 | Jolt verify-from-proof | Tried; blocked. The `JoltProof<F, C, PCS, FS>` type isn't re-exported by `#[jolt::provable]`. Wiring `CanonicalDeserialize` requires importing `jolt-core`'s field/curve/PCS/transcript types and pinning Jolt's exact instantiation — tighter coupling than the spike warrants. | Doesn't block bench (prove already calls verify in-process). Re-evaluate if Jolt is picked at the M3 prover-pick gate. |
 | Sonobe verify-from-proof | Functional but slow — re-runs preprocessing every call instead of caching verifier params | Verify times reported by `cmd_verify` include preprocessing; bench numbers are unaffected (they don't re-preprocess). |
-| M2 prover & end-to-end statement | The full M2 statement (signed manifest + Merkle auth + decode_toy + PSNR comparator, all in one proof) isn't built yet | Each piece exists native; the prover/guest binary that composes them is the next M2 milestone. |
+| §3.4.3 tampering test ("substitute different image as witness, prover cannot produce valid proof") | Needs the actual prover; the host's smoke command can't simulate "prover failure" because it's not a prover. | First prove pass on the A10 (phase 10) plus a follow-up tampered-witness prove that asserts non-zero exit / digest mismatch. |
 
 ## Re-running individual phases
 

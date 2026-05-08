@@ -11,5 +11,6 @@ std = []
 
 [dependencies]
 serde.workspace = true
+serde-big-array.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true

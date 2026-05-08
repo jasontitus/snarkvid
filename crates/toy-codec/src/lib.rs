@@ -36,7 +36,7 @@ use alloc::vec::Vec;
 extern crate std;
 
 /// A single YUV 4:2:0 frame.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct YuvFrame {
     pub width: u16,
     pub height: u16,
@@ -46,7 +46,7 @@ pub struct YuvFrame {
 }
 
 /// BlockQuant bitstream header.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BqHeader {
     pub width: u16,
     pub height: u16,
@@ -55,7 +55,7 @@ pub struct BqHeader {
 }
 
 /// Compressed representation: header + coefficient stream.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BqBitstream {
     pub header: BqHeader,
     pub coeffs_y: Vec<i16>,

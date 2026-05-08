@@ -1,0 +1,37 @@
+[package]
+name = "snarkvid-prover-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "prover-host"
+path = "src/main.rs"
+
+[features]
+default = []
+# Pull in SP1 SDK and trigger build.rs to cross-compile the guest.
+# The smoke subcommand works without this; the prove subcommand needs it.
+# Requires sp1up + the +succinct toolchain installed on the host machine.
+build-guest = ["dep:sp1-sdk"]
+
+[dependencies]
+# M2 statement and friends, by relative path so changes upstairs flow
+# through to the prover without a publish step.
+snarkvid-m2-statement = { path = "../../crates/m2-statement" }
+snarkvid-toy-codec    = { path = "../../crates/toy-codec" }
+snarkvid-manifest     = { path = "../../crates/manifest" }
+snarkvid-comparator   = { path = "../../crates/comparator" }
+
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+ed25519-dalek.workspace = true
+
+# SP1 SDK only when build-guest feature is on (tokio comes with it).
+sp1-sdk = { workspace = true, optional = true }
+tokio.workspace = true
+
+[build-dependencies]
+sp1-build = { workspace = true }

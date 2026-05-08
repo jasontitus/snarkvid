@@ -16,3 +16,4 @@ default = ["std"]
 std = []
 
 [dependencies]
+serde = { workspace = true }

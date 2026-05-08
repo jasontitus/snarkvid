@@ -83,6 +83,52 @@ pub fn frame_merkle_leaves(frame: &YuvFrame) -> Vec<[u8; 32]> {
     leaves
 }
 
+/// SHA-256 over the public M2 inputs (everything a verifier sees on
+/// chain). The host computes this; the guest commits the same value
+/// so the verifier can recompute and cross-check. Deterministic
+/// across host/guest by hashing only primitives — no serde/bincode
+/// involved, so no version-drift risk between the host (std) and
+/// guest (no_std) builds.
+///
+/// Layout (length-prefixed):
+///   - bitstream.header: u16le width, u16le height, u8 qp, u8 chroma_format
+///   - bitstream.coeffs_y: u32le len + i16le * len
+///   - bitstream.coeffs_u: same
+///   - bitstream.coeffs_v: same
+///   - signed.body.to_bytes() (manifest's existing canonical encoding)
+///   - signed.pubkey (32 bytes)
+///   - signed.signature (64 bytes)
+///   - tolerance_db_scaled (i64le)
+pub fn public_inputs_digest(
+    signed: &SignedManifest,
+    bitstream: &BqBitstream,
+    tolerance_db_scaled: i64,
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(&bitstream.header.width.to_le_bytes());
+    h.update(&bitstream.header.height.to_le_bytes());
+    h.update(&[bitstream.header.qp, bitstream.header.chroma_format]);
+
+    let mut hash_coeffs = |coeffs: &[i16]| {
+        h.update(&(coeffs.len() as u32).to_le_bytes());
+        for c in coeffs {
+            h.update(&c.to_le_bytes());
+        }
+    };
+    hash_coeffs(&bitstream.coeffs_y);
+    hash_coeffs(&bitstream.coeffs_u);
+    hash_coeffs(&bitstream.coeffs_v);
+
+    let body_bytes = signed.body.to_bytes();
+    h.update(&(body_bytes.len() as u32).to_le_bytes());
+    h.update(&body_bytes);
+    h.update(&signed.pubkey);
+    h.update(&signed.signature);
+    h.update(&tolerance_db_scaled.to_le_bytes());
+
+    h.finalize().into()
+}
+
 /// Run the M2 verifier check. Identical contract whether called
 /// natively from the host (smoke command), inside the SP1 guest
 /// (in-circuit), or from the integration test.
