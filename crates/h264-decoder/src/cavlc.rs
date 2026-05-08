@@ -269,12 +269,41 @@ pub const COEFF_TOKEN_VLC0: &[VlcEntry] = &[
     ct(0b0000000001010,    13,  8, 1),
     ct(0b0000000001101,    13,  8, 2),
     ct(0b0000000100,       10,  8, 3),
-    // Rows TC=9..16 (the high-coefficient-count entries) and the
-    // remainder of VLC1, VLC2 land alongside total_zeros / run_before
-    // in the next CAVLC session. The cases above cover every codeword
-    // exercised by the live x264 corpus + the `read_vlc` primitive
-    // tests, and are sufficient for any block with ≤ 8 nonzero
-    // coefficients (the common case in low-QP I-frames).
+    // TC=9, T1=0..=3
+    ct(0b00000000001111,   14,  9, 0),
+    ct(0b00000000001110,   14,  9, 1),
+    ct(0b00000000001101,   14,  9, 2),
+    ct(0b000000000110,     12,  9, 3),
+    // TC=10, T1=0..=3
+    ct(0b00000000001011,   14, 10, 0),
+    ct(0b00000000001010,   14, 10, 1),
+    ct(0b00000000001001,   14, 10, 2),
+    ct(0b00000000001100,   14, 10, 3),
+    // TC=11, T1=0..=3
+    ct(0b000000000001111,  15, 11, 0),
+    ct(0b000000000001110,  15, 11, 1),
+    ct(0b000000000001101,  15, 11, 2),
+    ct(0b000000000001100,  15, 11, 3),
+    // TC=12, T1=0..=3
+    ct(0b000000000001011,  15, 12, 0),
+    ct(0b000000000001010,  15, 12, 1),
+    ct(0b000000000001001,  15, 12, 2),
+    ct(0b000000000001000,  15, 12, 3),
+    // TC=13, T1=0..=3
+    ct(0b000000000000111,  15, 13, 0),
+    ct(0b000000000000110,  15, 13, 1),
+    ct(0b000000000000101,  15, 13, 2),
+    ct(0b000000000000100,  15, 13, 3),
+    // TC=14, T1=0..=3
+    ct(0b0000000000000111, 16, 14, 0),
+    ct(0b0000000000000110, 16, 14, 1),
+    ct(0b0000000000000101, 16, 14, 2),
+    ct(0b0000000000000100, 16, 14, 3),
+    // TC=15..=16: the codewords are 16 bits long with several
+    // sub-cases that I haven't verified against a spec source I
+    // trust. Leaving as TODO — `read_vlc` will return CavlcInvalid
+    // if a real codeword in this range arrives, which the corpus
+    // test surfaces as a quantitative gap in the SAD metric.
 ];
 
 /// Table 9-5 (b): nC ∈ [2, 4). Stub for this session — the four
