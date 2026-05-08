@@ -9,6 +9,8 @@ members = [
     "crates/manifest",
     "crates/comparator",
     "crates/m2-statement",
+    "crates/h264-decoder",
+    "crates/h264-test-vectors",
     "bin/toy-encode",
 ]
 exclude = [

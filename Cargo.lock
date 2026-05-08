@@ -374,6 +374,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "snarkvid-h264-decoder"
+version = "0.0.0"
+dependencies = [
+ "snarkvid-h264-test-vectors",
+]
+
+[[package]]
+name = "snarkvid-h264-test-vectors"
+version = "0.0.0"
+
+[[package]]
 name = "snarkvid-m2-statement"
 version = "0.0.0"
 dependencies = [
