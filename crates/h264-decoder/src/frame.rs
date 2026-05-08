@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 
 use crate::bitreader::BitReader;
 use crate::DecodeError;
-use crate::mb::{parse_macroblock_header, MacroblockHeader, MbType};
+use crate::mb::{decode_macroblock_residuals, parse_macroblock_header, MacroblockHeader, MbType};
 use crate::nal::{strip_emulation_prevention, NalUnitIterator, nut};
 use crate::slice::{Pps, SliceHeader, Sps};
 
@@ -130,18 +130,31 @@ pub fn decode_iframe(bitstream: &[u8]) -> Result<DecodedFrame, DecodeError> {
             qp_y = qp_y + mb_header.mb_qp_delta;
             qp_y = wrap_qp(qp_y);
 
-            // Residual decode + intra prediction + reconstruction is
-            // the next chunk. For now, fill the MB with a constant
-            // derived from mb_type so the test harness sees a
-            // distinguishable signature instead of all-128.
-            let signature = mb_signature(&mb_header);
+            // Try to decode residual data; fall through to placeholder
+            // fill on any CAVLC-table-not-yet-filled error so the rest
+            // of the frame can still be inspected.
+            let residuals = match decode_macroblock_residuals(&mut br, &mb_header) {
+                Ok(r) => r,
+                Err(DecodeError::OutOfScope(_)) | Err(DecodeError::CavlcInvalid)
+                | Err(DecodeError::BitstreamTruncated) => {
+                    fill_mb_solid(&mut y_plane, &mut u_plane, &mut v_plane,
+                                  pic_w, mb_col, mb_row, mb_signature(&mb_header));
+                    continue;
+                }
+                Err(other) => return Err(other),
+            };
+
+            // Reconstruction (intra prediction + add residual + clamp +
+            // write reconstructed pixels back as neighbors for the next
+            // MB) is the next chunk. For now, fill with a signature
+            // derived from the residual count so we can see at a glance
+            // whether residuals decoded.
+            let nonzero_blocks: u32 = residuals.luma_4x4.iter()
+                .filter(|b| b.is_some())
+                .count() as u32;
+            let signature = (mb_signature(&mb_header) as u32 + nonzero_blocks * 5).min(255) as u8;
             fill_mb_solid(&mut y_plane, &mut u_plane, &mut v_plane,
                           pic_w, mb_col, mb_row, signature);
-
-            // Suppress unused warning.
-            let _ = &mb_header.intra_4x4_modes;
-            let _ = &mb_header.intra_chroma_pred_mode;
-            let _ = mb_header.cbp;
         }
     }
 

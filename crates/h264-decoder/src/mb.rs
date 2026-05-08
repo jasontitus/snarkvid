@@ -263,6 +263,139 @@ pub fn parse_macroblock_header(br: &mut BitReader) -> Result<MacroblockHeader, D
     })
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Residual decode
+//
+// After the MB header, the encoder emits residual block data per
+// CBP: 16 luma 4×4 blocks (or skipped where CBP_luma bit is 0),
+// then chroma DC + AC blocks based on CBP_chroma. CAVLC entropy
+// decode → inverse quantize → IDCT yields the residual sample
+// values that get added to the predicted pixels.
+//
+// This module produces the *raw decoded levels* (one [i32; 16] per
+// 4×4 block); reconstruction (intra prediction + add residual +
+// clamp) lives in frame.rs because it needs cross-MB neighbor state.
+// ─────────────────────────────────────────────────────────────────────
+
+use crate::cavlc::{decode_residual_block_4x4, CoeffTokenVariant};
+
+/// Decoded residual data for one I-slice macroblock. Each entry is
+/// 16 dequantized levels in raster order, ready for IDCT. `None`
+/// signals "this block was skipped by CBP".
+#[derive(Clone, Debug)]
+pub struct MacroblockResiduals {
+    /// 16 luma 4×4 blocks in spec block-scan order (luma4x4BlkIdx
+    /// 0..=15). Each is `Some(coeffs)` if CBP_luma had that block's
+    /// 8×8-cluster bit set, else `None`.
+    pub luma_4x4: [Option<[i32; 16]>; 16],
+    /// 4 chroma U DC + 4 chroma U AC coefficients. Empty if
+    /// CBP_chroma == 0.
+    pub chroma_u_dc: Option<[i32; 4]>,
+    pub chroma_u_ac: [Option<[i32; 16]>; 4],
+    pub chroma_v_dc: Option<[i32; 4]>,
+    pub chroma_v_ac: [Option<[i32; 16]>; 4],
+}
+
+impl MacroblockResiduals {
+    fn empty() -> Self {
+        Self {
+            luma_4x4: [None; 16],
+            chroma_u_dc: None,
+            chroma_u_ac: [None; 4],
+            chroma_v_dc: None,
+            chroma_v_ac: [None; 4],
+        }
+    }
+}
+
+/// Decode the residual data following an MB header.
+///
+/// `header.cbp.luma` is a 4-bit field where each bit gates a 4-luma-
+/// block group (8×8 cluster). For an I-slice baseline MB:
+///   - bit 0 covers luma blocks 0,1,4,5
+///   - bit 1 covers luma blocks 2,3,6,7
+///   - bit 2 covers luma blocks 8,9,12,13
+///   - bit 3 covers luma blocks 10,11,14,15
+/// Within a gated cluster, all 4 sub-blocks are individually CAVLC-
+/// decoded (no further conditioning).
+///
+/// For chroma:
+///   - cbp.chroma == 0 → no chroma residual
+///   - cbp.chroma >= 1 → read U/V chroma DC pair (2×2 Hadamard input)
+///   - cbp.chroma >= 2 → also read U/V chroma AC blocks
+///
+/// nC selection: a proper implementation derives nC from the neighbor
+/// blocks' TotalCoeff. For a first-pass corpus decode we use Vlc0
+/// (nC < 2), which the spec defines as the fallback when neighbors
+/// are unavailable. This will undercount nC for inner MBs of larger
+/// frames; flagged in TESTING.md as a follow-up.
+pub fn decode_macroblock_residuals(
+    br: &mut BitReader,
+    header: &MacroblockHeader,
+) -> Result<MacroblockResiduals, DecodeError> {
+    let mut out = MacroblockResiduals::empty();
+    if matches!(header.mb_type, MbType::IPcm) {
+        return Err(DecodeError::OutOfScope("I_PCM residual"));
+    }
+
+    // Luma 4×4 blocks. Spec block-scan order is non-trivial; for
+    // baseline 4:2:0 it's the order from spec §6.4.3 / Figure 6-12.
+    // For a first cut we walk in raster order (which is correct for
+    // the all-CBP-bits-set case, modulo the spec's z-scan traversal
+    // which only matters for adjacency-based nC).
+    if matches!(header.mb_type, MbType::INxN | MbType::I16x16 { .. }) {
+        // For each 8×8 cluster, check the corresponding CBP_luma bit.
+        for cluster in 0..4 {
+            let cluster_active = (header.cbp.luma >> cluster) & 1 == 1;
+            if !cluster_active { continue; }
+            // Sub-block indices in this cluster (spec block-scan):
+            //   cluster 0 → blocks 0, 1, 4, 5
+            //   cluster 1 → blocks 2, 3, 6, 7
+            //   cluster 2 → blocks 8, 9, 12, 13
+            //   cluster 3 → blocks 10, 11, 14, 15
+            let block_indices: [usize; 4] = match cluster {
+                0 => [0, 1, 4, 5],
+                1 => [2, 3, 6, 7],
+                2 => [8, 9, 12, 13],
+                3 => [10, 11, 14, 15],
+                _ => unreachable!(),
+            };
+            for &blk in &block_indices {
+                let coeffs = decode_residual_block_4x4(br, CoeffTokenVariant::Vlc0)?;
+                out.luma_4x4[blk] = Some(coeffs);
+            }
+        }
+    }
+
+    // Chroma DC pair (U then V), if CBP_chroma > 0.
+    if header.cbp.chroma >= 1 {
+        // Each chroma DC block has up to 4 nonzero coefficients
+        // (the 2×2 Hadamard space). Decoded as a chroma DC variant
+        // of CAVLC; for now reuse the chroma_dc_420 coeff_token.
+        let u_dc = decode_residual_block_4x4(br, CoeffTokenVariant::ChromaDc420)?;
+        // We only need the first 4 coefficients (2×2 Hadamard), but
+        // decode_residual_block_4x4 always returns 16. Take the first
+        // 4 from raster order.
+        out.chroma_u_dc = Some([u_dc[0], u_dc[1], u_dc[4], u_dc[5]]);
+        let v_dc = decode_residual_block_4x4(br, CoeffTokenVariant::ChromaDc420)?;
+        out.chroma_v_dc = Some([v_dc[0], v_dc[1], v_dc[4], v_dc[5]]);
+    }
+
+    // Chroma AC blocks (4 U + 4 V), if CBP_chroma == 2.
+    if header.cbp.chroma >= 2 {
+        for blk in 0..4 {
+            let u_ac = decode_residual_block_4x4(br, CoeffTokenVariant::Vlc0)?;
+            out.chroma_u_ac[blk] = Some(u_ac);
+        }
+        for blk in 0..4 {
+            let v_ac = decode_residual_block_4x4(br, CoeffTokenVariant::Vlc0)?;
+            out.chroma_v_ac[blk] = Some(v_ac);
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
