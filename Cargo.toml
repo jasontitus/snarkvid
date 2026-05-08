@@ -8,6 +8,7 @@ members = [
     "crates/toy-codec",
     "crates/manifest",
     "crates/comparator",
+    "crates/m2-statement",
     "bin/toy-encode",
 ]
 exclude = [

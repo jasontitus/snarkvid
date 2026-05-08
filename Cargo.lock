@@ -365,6 +365,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "snarkvid-m2-statement"
+version = "0.0.0"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+ "snarkvid-comparator",
+ "snarkvid-manifest",
+ "snarkvid-toy-codec",
+]
+
+[[package]]
 name = "snarkvid-manifest"
 version = "0.0.0"
 dependencies = [
@@ -419,6 +430,7 @@ dependencies = [
  "ed25519-dalek",
  "sha2",
  "snarkvid-comparator",
+ "snarkvid-m2-statement",
  "snarkvid-manifest",
  "snarkvid-toy-codec",
 ]

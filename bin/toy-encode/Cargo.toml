@@ -18,5 +18,6 @@ anyhow = "1"
 # M2 pipeline integration test composes all three native crates.
 snarkvid-comparator = { path = "../../crates/comparator" }
 snarkvid-manifest = { path = "../../crates/manifest" }
+snarkvid-m2-statement = { path = "../../crates/m2-statement" }
 sha2 = "0.10"
 ed25519-dalek.workspace = true
