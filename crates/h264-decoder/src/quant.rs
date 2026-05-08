@@ -117,6 +117,98 @@ pub fn inverse_quant_4x4_ac(
     Ok(out)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Hadamard-DC variants (Intra_16×16 luma DC and 4:2:0 chroma DC)
+//
+// For Intra_16×16 macroblocks, the 16 DC coefficients (one per 4×4
+// luma block) go through an additional 4×4 Hadamard pass before
+// per-block IDCT. The DC values themselves are dequantized with a
+// different scaling rule that compensates for the Hadamard's gain.
+//
+// For 4:2:0 chroma, the 4 DC values of each chroma plane go through
+// a 2×2 Hadamard with its own scaling rule.
+//
+// Both share NORM_ADJUST_4X4[m][0] (the v=0 column) since DC sits at
+// position (0,0) where v=0.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Inverse-scale a Hadamard-decoded 4×4 luma-DC block per
+/// spec §8.5.10 step 7. Input: 16 i32 values straight out of
+/// `transform::hadamard_4x4`. Output: dequantized DC values
+/// ready to be reinserted into their respective 4×4 blocks
+/// (at position [0][0] each) before per-block IDCT.
+///
+/// Formula:
+///   if qP >= 36:
+///     dc'[i,j] = (hadamard[i,j] * LevelScale4×4(qP%6, 0, 0)) << (qP/6 - 6)
+///   else if qP >= 12:  // boundary; multiplicative form
+///     dc'[i,j] = (hadamard[i,j] * LevelScale4×4(qP%6, 0, 0)) >> (6 - qP/6)
+///   else:
+///     dc'[i,j] = (hadamard[i,j] * LevelScale4×4(qP%6, 0, 0) +
+///                 (1 << (5 - qP/6))) >> (6 - qP/6)
+///
+/// Simplified: the spec breaks at qP=36 (qP/6 = 6, no shift); for qP < 36
+/// we shift right, for qP >= 36 we shift left. We collapse into one
+/// branch with a signed shift amount.
+pub fn inverse_quant_luma_dc_intra16x16(
+    hadamard_block: &[i32; 16],
+    qp: u32,
+) -> Result<[i32; 16], DecodeError> {
+    if qp > 51 {
+        return Err(DecodeError::OutOfScope("qp > 51 (8-bit baseline only)"));
+    }
+    let m = qp % 6;
+    let qp_div_6 = (qp / 6) as i32;
+    let scale_v0 = NORM_ADJUST_4X4[m as usize][0] * DEFAULT_WEIGHT_SCALE_4X4;
+    let mut out = [0i32; 16];
+    for k in 0..16 {
+        let prod = hadamard_block[k] * scale_v0;
+        out[k] = if qp_div_6 >= 6 {
+            // qP >= 36: left shift by (qP/6 - 6).
+            prod << (qp_div_6 - 6)
+        } else {
+            // qP < 36: right shift by (6 - qP/6) with rounding bias.
+            let shift = 6 - qp_div_6;
+            (prod + (1 << (shift - 1))) >> shift
+        };
+    }
+    Ok(out)
+}
+
+/// Inverse-scale the Hadamard-decoded 2×2 chroma-DC block per
+/// spec §8.5.11.1. Different shift constants from the luma DC case
+/// because the 2×2 Hadamard has gain 4 (not 16).
+///
+/// Formula (with `qP_C` the chroma-adjusted QP):
+///   dc'[i,j] = (hadamard[i,j] * LevelScale4×4(qP%6, 0, 0)) << (qP/6 - 5)   for qP/6 >= 5
+///   dc'[i,j] = (hadamard[i,j] * LevelScale4×4(qP%6, 0, 0)) >> (5 - qP/6)   for qP/6 < 5
+///
+/// Note: the spec uses `>>1` form rather than `+round >> shift`, so
+/// the chroma DC scaling lacks the rounding bias the luma DC has.
+/// (Per spec §8.5.11.1 — verified.)
+pub fn inverse_quant_chroma_dc_4x4(
+    hadamard_block: &[i32; 4],
+    qp: u32,
+) -> Result<[i32; 4], DecodeError> {
+    if qp > 51 {
+        return Err(DecodeError::OutOfScope("qp > 51"));
+    }
+    let m = qp % 6;
+    let qp_div_6 = (qp / 6) as i32;
+    let scale_v0 = NORM_ADJUST_4X4[m as usize][0] * DEFAULT_WEIGHT_SCALE_4X4;
+    let mut out = [0i32; 4];
+    for k in 0..4 {
+        let prod = hadamard_block[k] * scale_v0;
+        out[k] = if qp_div_6 >= 5 {
+            prod << (qp_div_6 - 5)
+        } else {
+            // No rounding bias per spec §8.5.11.1.
+            prod >> (5 - qp_div_6)
+        };
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +438,73 @@ mod tests {
                 "round-trip diff > 1 at idx {}: got {} expected {} (residual={:?})",
                 i, residual[i], original[i], residual);
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Hadamard-DC variant tests
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn luma_dc_zero_block_yields_zero_block() {
+        for qp in 0..=51 {
+            let zero = [0i32; 16];
+            assert_eq!(inverse_quant_luma_dc_intra16x16(&zero, qp).unwrap(), zero);
+        }
+    }
+
+    #[test]
+    fn luma_dc_qp_36_is_pure_multiplicative() {
+        // qP=36: m=0, qp_div_6=6 → shift left by 0.
+        // scale_v0 = 10 * 16 = 160.
+        // dc[0]=10 → 10 * 160 = 1600.
+        let mut block = [0i32; 16];
+        block[0] = 10;
+        let out = inverse_quant_luma_dc_intra16x16(&block, 36).unwrap();
+        assert_eq!(out[0], 1600);
+    }
+
+    #[test]
+    fn luma_dc_qp_48_left_shifts_by_2() {
+        // qP=48: m=0, qp_div_6=8 → shift left by 2.
+        // scale_v0 = 160. dc[0]=3 → 3 * 160 << 2 = 1920.
+        let mut block = [0i32; 16];
+        block[0] = 3;
+        let out = inverse_quant_luma_dc_intra16x16(&block, 48).unwrap();
+        assert_eq!(out[0], 1920);
+    }
+
+    #[test]
+    fn luma_dc_qp_0_right_shifts_with_rounding() {
+        // qP=0: m=0, qp_div_6=0 → shift right by 6, round = 1<<5 = 32.
+        // scale_v0 = 160. dc[0]=10 → (10*160 + 32) >> 6 = (1600+32)/64 = 25.
+        let mut block = [0i32; 16];
+        block[0] = 10;
+        let out = inverse_quant_luma_dc_intra16x16(&block, 0).unwrap();
+        assert_eq!(out[0], 25);
+    }
+
+    #[test]
+    fn chroma_dc_zero_block_yields_zero() {
+        for qp in 0..=51 {
+            assert_eq!(inverse_quant_chroma_dc_4x4(&[0; 4], qp).unwrap(), [0; 4]);
+        }
+    }
+
+    #[test]
+    fn chroma_dc_qp_30_is_pure_multiplicative() {
+        // qP=30: m=0, qp_div_6=5 → shift left by 0.
+        // scale_v0 = 160. dc[0]=4 → 4 * 160 = 640.
+        let block = [4, 0, 0, 0];
+        let out = inverse_quant_chroma_dc_4x4(&block, 30).unwrap();
+        assert_eq!(out[0], 640);
+    }
+
+    #[test]
+    fn chroma_dc_qp_18_right_shifts_by_2_no_rounding() {
+        // qP=18: m=0, qp_div_6=3 → shift right by 2 (no round bias).
+        // scale_v0 = 160. dc[0]=10 → 10*160 >> 2 = 400.
+        let block = [10, 0, 0, 0];
+        let out = inverse_quant_chroma_dc_4x4(&block, 18).unwrap();
+        assert_eq!(out[0], 400);
     }
 }

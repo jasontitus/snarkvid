@@ -28,6 +28,7 @@ extern crate alloc;
 
 pub mod bitreader;
 pub mod cavlc;
+pub mod frame;
 pub mod intra;
 pub mod mb;
 pub mod nal;
