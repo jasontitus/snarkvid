@@ -1,0 +1,31 @@
+# Jolt guest crate. Targets RISC-V (riscv32imac or riscv64imac) when
+# Jolt's build pipeline compiles it; targets the host arch when the
+# script crate compiles its `host` feature shim.
+#
+# The `#[jolt::provable]` attribute generates `compile_*`,
+# `preprocess_shared_*`, `preprocess_prover_*`, `preprocess_verifier_*`,
+# `build_prover_*`, `build_verifier_*` symbols against this lib.
+
+[package]
+name = "snarkvid-spike-jolt-program"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+guest = []
+# Jolt's compile pipeline passes --features compute_advice; the guest
+# must declare it so the build doesn't fail with "unknown feature."
+compute_advice = []
+
+[dependencies]
+# Jolt SDK — same pin policy as the host. When the guest is compiled
+# for RISC-V, Jolt's tooling sets the right features.
+jolt = { package = "jolt-sdk", git = "https://github.com/a16z/jolt.git", branch = "main", default-features = false }
+jolt-inlines-sha2 = { git = "https://github.com/a16z/jolt.git", branch = "main", default-features = false }
+
+# The same toy codec the M2 prover guest will use, no_std for guest
+# compatibility. Demonstrates that the Jolt RISC-V guest can run
+# arbitrary `no_std` Rust — the feature that distinguishes Jolt (and
+# SP1, RISC0) from folding-scheme libraries like Sonobe.

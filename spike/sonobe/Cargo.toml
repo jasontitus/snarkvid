@@ -1,0 +1,95 @@
+# Sonobe (Nova-CycleFold + DeciderEth) side of the milestone-1b spike.
+#
+# Sonobe is privacy-scaling-explorations/sonobe, a folding-schemes
+# library implementing Nova / CycleFold / HyperNova / ProtoGalaxy in
+# Rust. We use the Nova+CycleFold IVC with the Groth16/BN254 Decider —
+# the only path in the folding-scheme ecosystem (May 2026) that ends in
+# a small constant-size proof a browser can verify.
+#
+# Why Nova specifically:
+#   - Sonobe Nova+CycleFold is audited (HyperNova/ProtoGalaxy are not).
+#   - DeciderEth wraps the IVC accumulator into a Groth16-over-BN254
+#     proof (~200 bytes) verifiable by any standard Groth16 verifier,
+#     including off-the-shelf WASM verifiers.
+#   - The "step circuit F applied N times" model matches per-macroblock
+#     decoding loops once we get to a real H.264 decoder.
+#
+# Sonobe has no tagged release as of May 2026; pin to a commit on main.
+
+[package]
+name = "snarkvid-spike-sonobe"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "sonobe-script"
+path = "src/main.rs"
+
+[dependencies]
+# Sonobe — pin to a known commit on main. Update with whatever HEAD is
+# when you actually run this; there is no semver to bind to.
+folding-schemes = { git = "https://github.com/privacy-scaling-explorations/sonobe.git", branch = "main" }
+solidity-verifiers = { git = "https://github.com/privacy-scaling-explorations/sonobe.git", branch = "main", optional = true }
+
+# arkworks ecosystem (Sonobe pins specific revs internally; we let cargo
+# resolve compatible versions).
+ark-bn254 = "0.5"
+ark-grumpkin = "0.5"
+ark-ff = "0.5"
+ark-ec = "0.5"
+ark-r1cs-std = "0.5"
+ark-relations = "0.5"
+ark-crypto-primitives = { version = "0.5", features = ["sponge", "crh", "merkle_tree", "constraints"] }
+ark-serialize = "0.5"
+ark-std = "0.5"
+
+# Application-level deps
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.8"
+
+# Local toy-codec — same crate the M2 prover guest will use. no_std but
+# we use it natively here (the Sonobe toy_decode step circuit re-expresses
+# the decode logic as R1CS gates; this dep gives us native test vectors).
+snarkvid-toy-codec = { path = "../../crates/toy-codec" }
+
+[features]
+default = []
+# Enable to attempt Decider (Groth16 wrap) end-to-end. Turned off in
+# default builds because it pulls additional deps and the workflow is
+# still being shaken out.
+decider = ["dep:solidity-verifiers"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Sonobe pulls forked / git-HEAD arkworks crates rather than crates.io
+# versions. We mirror the same [patch.crates-io] block sonobe uses so
+# our downstream consumer resolves the same graph.
+#
+# Source of truth: privacy-scaling-explorations/sonobe Cargo.toml main.
+# Update these revs when you bump the sonobe pin above.
+[patch.crates-io]
+ark-groth16 = { git = "https://github.com/arkworks-rs/groth16", rev = "b3b4a15" }
+ark-ff = { git = "https://github.com/arkworks-rs/algebra" }
+ark-ec = { git = "https://github.com/arkworks-rs/algebra" }
+ark-serialize = { git = "https://github.com/arkworks-rs/algebra" }
+ark-poly = { git = "https://github.com/arkworks-rs/algebra" }
+ark-relations = { git = "https://github.com/arkworks-rs/snark" }
+ark-snark = { git = "https://github.com/arkworks-rs/snark" }
+ark-crypto-primitives = { git = "https://github.com/flyingnobita/crypto-primitives", rev = "f559264" }
+ark-r1cs-std = { git = "https://github.com/flyingnobita/r1cs-std_yelhousni", rev = "b4bab0c" }
+ark-std = { git = "https://github.com/arkworks-rs/std" }
+ark-poly-commit = { git = "https://github.com/arkworks-rs/poly-commit" }
+ark-bn254 = { git = "https://github.com/arkworks-rs/algebra" }
+ark-grumpkin = { git = "https://github.com/arkworks-rs/algebra" }
+ark-pallas = { git = "https://github.com/arkworks-rs/algebra" }
+ark-vesta = { git = "https://github.com/arkworks-rs/algebra" }
+ark-mnt4-298 = { git = "https://github.com/arkworks-rs/algebra" }
+ark-mnt6-298 = { git = "https://github.com/arkworks-rs/algebra" }

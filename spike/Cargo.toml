@@ -17,6 +17,9 @@ exclude = [
     "risc0",
     "sp1",
     "sp1/program",
+    "sonobe",
+    "jolt",
+    "jolt/guest",
 ]
 
 [workspace.package]

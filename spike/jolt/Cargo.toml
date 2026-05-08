@@ -1,0 +1,61 @@
+# Jolt side of the M1b spike.
+#
+# Single-package layout mirroring a16z/jolt examples/sha2-ex/: a host
+# binary at the root, a guest crate in guest/. The Jolt CLI (`jolt build`)
+# requires this layout — it cannot cross-compile a guest that's a
+# workspace member outside the host's own package directory.
+#
+# Jolt has no semver release in May 2026; pin a specific commit on
+# a16z/jolt main when you actually run this. The API has churned twice:
+# Aug 2025 (Twist-and-Shout) split preprocess into 3 calls; Mar 2026
+# (NovaBlindFold) added an Option arg.
+
+# spike/jolt is its own workspace (root + member). The jolt CLI invokes
+# `cargo build -p <guest-package>` which only works when host and guest
+# are both workspace members.
+[workspace]
+members = ["guest", "guest-toy-decode"]
+
+[package]
+name = "snarkvid-spike-jolt-script"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "jolt-script"
+path = "src/main.rs"
+
+[dependencies]
+jolt-sdk = { git = "https://github.com/a16z/jolt.git", branch = "main", features = ["host"] }
+jolt-inlines-sha2 = { git = "https://github.com/a16z/jolt.git", branch = "main", features = ["host"] }
+
+# Guest crates as path deps. Each #[jolt::provable] function lives in
+# its own guest crate (Jolt macro emits a top-level `main` per provable).
+guest = { package = "snarkvid-spike-jolt-program", path = "./guest" }
+guest_toy_decode = { package = "snarkvid-spike-jolt-toy-decode", path = "./guest-toy-decode" }
+
+# Native cross-check of decode_toy.
+snarkvid-toy-codec = { path = "../../crates/toy-codec" }
+
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.8"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Jolt requires its own arkworks fork. Mirror the patches verbatim.
+[patch.crates-io]
+ark-bn254 = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+ark-ff = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+ark-ec = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+allocative = { git = "https://github.com/facebookexperimental/allocative", rev = "85b773d85d526d068ce94724ff7a7b81203fc95e" }
