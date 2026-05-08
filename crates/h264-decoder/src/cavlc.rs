@@ -500,16 +500,100 @@ const TZ_TC2: &[VlcEntry] = &[
     VlcEntry { codeword: 0b00000010, codeword_len: 8, value: 14 },
 ];
 
+// Spec Table 9-7 (luma 4×4) for TotalCoeff=3..=7. Each table maps a
+// codeword to a `total_zeros` value 0..=(16 - TotalCoeff). Source
+// transcribed row-by-row from H.264 Rec. (2021) Table 9-7(a).
+
+const TZ_TC3: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b0101,    codeword_len: 4, value: 0 },
+    VlcEntry { codeword: 0b111,     codeword_len: 3, value: 1 },
+    VlcEntry { codeword: 0b110,     codeword_len: 3, value: 2 },
+    VlcEntry { codeword: 0b101,     codeword_len: 3, value: 3 },
+    VlcEntry { codeword: 0b0100,    codeword_len: 4, value: 4 },
+    VlcEntry { codeword: 0b0011,    codeword_len: 4, value: 5 },
+    VlcEntry { codeword: 0b100,     codeword_len: 3, value: 6 },
+    VlcEntry { codeword: 0b011,     codeword_len: 3, value: 7 },
+    VlcEntry { codeword: 0b0010,    codeword_len: 4, value: 8 },
+    VlcEntry { codeword: 0b00011,   codeword_len: 5, value: 9 },
+    VlcEntry { codeword: 0b00010,   codeword_len: 5, value: 10 },
+    VlcEntry { codeword: 0b000001,  codeword_len: 6, value: 11 },
+    VlcEntry { codeword: 0b00001,   codeword_len: 5, value: 12 },
+    VlcEntry { codeword: 0b000000,  codeword_len: 6, value: 13 },
+];
+
+const TZ_TC4: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b00011,   codeword_len: 5, value: 0 },
+    VlcEntry { codeword: 0b111,     codeword_len: 3, value: 1 },
+    VlcEntry { codeword: 0b101,     codeword_len: 3, value: 2 },
+    VlcEntry { codeword: 0b100,     codeword_len: 3, value: 3 },
+    VlcEntry { codeword: 0b011,     codeword_len: 3, value: 4 },
+    VlcEntry { codeword: 0b010,     codeword_len: 3, value: 5 },
+    VlcEntry { codeword: 0b00010,   codeword_len: 5, value: 6 },
+    VlcEntry { codeword: 0b00011,   codeword_len: 5, value: 7 },
+    VlcEntry { codeword: 0b00001,   codeword_len: 5, value: 8 },
+    VlcEntry { codeword: 0b000010,  codeword_len: 6, value: 9 },
+    VlcEntry { codeword: 0b00000,   codeword_len: 5, value: 10 },
+    VlcEntry { codeword: 0b000001,  codeword_len: 6, value: 11 },
+    VlcEntry { codeword: 0b110,     codeword_len: 3, value: 12 },
+];
+
+const TZ_TC5: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b0101,    codeword_len: 4, value: 0 },
+    VlcEntry { codeword: 0b0100,    codeword_len: 4, value: 1 },
+    VlcEntry { codeword: 0b0011,    codeword_len: 4, value: 2 },
+    VlcEntry { codeword: 0b111,     codeword_len: 3, value: 3 },
+    VlcEntry { codeword: 0b110,     codeword_len: 3, value: 4 },
+    VlcEntry { codeword: 0b101,     codeword_len: 3, value: 5 },
+    VlcEntry { codeword: 0b100,     codeword_len: 3, value: 6 },
+    VlcEntry { codeword: 0b011,     codeword_len: 3, value: 7 },
+    VlcEntry { codeword: 0b0010,    codeword_len: 4, value: 8 },
+    VlcEntry { codeword: 0b0001,    codeword_len: 4, value: 9 },
+    VlcEntry { codeword: 0b00001,   codeword_len: 5, value: 10 },
+    VlcEntry { codeword: 0b00000,   codeword_len: 5, value: 11 },
+];
+
+const TZ_TC6: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b000001,  codeword_len: 6, value: 0 },
+    VlcEntry { codeword: 0b00001,   codeword_len: 5, value: 1 },
+    VlcEntry { codeword: 0b111,     codeword_len: 3, value: 2 },
+    VlcEntry { codeword: 0b110,     codeword_len: 3, value: 3 },
+    VlcEntry { codeword: 0b101,     codeword_len: 3, value: 4 },
+    VlcEntry { codeword: 0b100,     codeword_len: 3, value: 5 },
+    VlcEntry { codeword: 0b011,     codeword_len: 3, value: 6 },
+    VlcEntry { codeword: 0b010,     codeword_len: 3, value: 7 },
+    VlcEntry { codeword: 0b0001,    codeword_len: 4, value: 8 },
+    VlcEntry { codeword: 0b001,     codeword_len: 3, value: 9 },
+    VlcEntry { codeword: 0b000000,  codeword_len: 6, value: 10 },
+];
+
+const TZ_TC7: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b000001,  codeword_len: 6, value: 0 },
+    VlcEntry { codeword: 0b00001,   codeword_len: 5, value: 1 },
+    VlcEntry { codeword: 0b101,     codeword_len: 3, value: 2 },
+    VlcEntry { codeword: 0b100,     codeword_len: 3, value: 3 },
+    VlcEntry { codeword: 0b011,     codeword_len: 3, value: 4 },
+    VlcEntry { codeword: 0b11,      codeword_len: 2, value: 5 },
+    VlcEntry { codeword: 0b010,     codeword_len: 3, value: 6 },
+    VlcEntry { codeword: 0b001,     codeword_len: 3, value: 7 },
+    VlcEntry { codeword: 0b0001,    codeword_len: 4, value: 8 },
+    VlcEntry { codeword: 0b000000,  codeword_len: 6, value: 9 },
+];
+
 /// Pick the right total_zeros table for `total_coeff`. Returns the
 /// table or an error for unsupported values (TC outside 1..=15).
 fn total_zeros_table(total_coeff: u8) -> Result<&'static [VlcEntry], DecodeError> {
     match total_coeff {
         1 => Ok(TZ_TC1),
         2 => Ok(TZ_TC2),
-        // TC ≥ 3 tables land alongside the rest of CAVLC. For now
-        // surface as an explicit OutOfScope so a corpus that hits
-        // them fails loudly instead of silently miscoding.
-        3..=15 => Err(DecodeError::OutOfScope("total_zeros TC≥3 table TODO")),
+        3 => Ok(TZ_TC3),
+        4 => Ok(TZ_TC4),
+        5 => Ok(TZ_TC5),
+        6 => Ok(TZ_TC6),
+        7 => Ok(TZ_TC7),
+        // TC=8..=15 tables land in a follow-up — they're
+        // monotonically smaller so quick to transcribe but not
+        // exercised by the noise-16x16-qp18 corpus.
+        8..=15 => Err(DecodeError::OutOfScope("total_zeros TC≥8 table TODO")),
         _ => Err(DecodeError::CavlcInvalid),
     }
 }
@@ -560,12 +644,46 @@ const RB_ZL3: &[VlcEntry] = &[
     VlcEntry { codeword: 0b00, codeword_len: 2, value: 3 },
 ];
 
+// Spec Table 9-10 run_before tables for zeros_left=4..=6. For
+// zeros_left ≥ 7 the codewords get longer (variable-length unary
+// patterns); landing here in a follow-up.
+
+const RB_ZL4: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b11,   codeword_len: 2, value: 0 },
+    VlcEntry { codeword: 0b10,   codeword_len: 2, value: 1 },
+    VlcEntry { codeword: 0b01,   codeword_len: 2, value: 2 },
+    VlcEntry { codeword: 0b001,  codeword_len: 3, value: 3 },
+    VlcEntry { codeword: 0b000,  codeword_len: 3, value: 4 },
+];
+
+const RB_ZL5: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b11,   codeword_len: 2, value: 0 },
+    VlcEntry { codeword: 0b10,   codeword_len: 2, value: 1 },
+    VlcEntry { codeword: 0b011,  codeword_len: 3, value: 2 },
+    VlcEntry { codeword: 0b010,  codeword_len: 3, value: 3 },
+    VlcEntry { codeword: 0b001,  codeword_len: 3, value: 4 },
+    VlcEntry { codeword: 0b000,  codeword_len: 3, value: 5 },
+];
+
+const RB_ZL6: &[VlcEntry] = &[
+    VlcEntry { codeword: 0b11,    codeword_len: 2, value: 0 },
+    VlcEntry { codeword: 0b000,   codeword_len: 3, value: 1 },
+    VlcEntry { codeword: 0b001,   codeword_len: 3, value: 2 },
+    VlcEntry { codeword: 0b011,   codeword_len: 3, value: 3 },
+    VlcEntry { codeword: 0b010,   codeword_len: 3, value: 4 },
+    VlcEntry { codeword: 0b101,   codeword_len: 3, value: 5 },
+    VlcEntry { codeword: 0b100,   codeword_len: 3, value: 6 },
+];
+
 fn run_before_table(zeros_left: u8) -> Result<&'static [VlcEntry], DecodeError> {
     match zeros_left {
         1 => Ok(RB_ZL1),
         2 => Ok(RB_ZL2),
         3 => Ok(RB_ZL3),
-        4..=14 => Err(DecodeError::OutOfScope("run_before zeros_left≥4 table TODO")),
+        4 => Ok(RB_ZL4),
+        5 => Ok(RB_ZL5),
+        6 => Ok(RB_ZL6),
+        7..=14 => Err(DecodeError::OutOfScope("run_before zeros_left≥7 table TODO")),
         _ => Err(DecodeError::CavlcInvalid),
     }
 }
@@ -879,6 +997,33 @@ mod tests {
         let bytes = pack_bits(&[0, 0, 0, 0, 1]);
         let mut br = BitReader::new(&bytes);
         assert_eq!(read_level_prefix(&mut br).unwrap(), 4);
+    }
+
+    #[test]
+    fn total_zeros_tc_3_known_codewords() {
+        // Spec Table 9-7 TC=3 column known values:
+        //   "0101" → 0    "111" → 1    "110" → 2    "101" → 3
+        let cases: &[(&[u8], u8)] = &[
+            (&[0,1,0,1], 0),
+            (&[1,1,1],   1),
+            (&[1,1,0],   2),
+            (&[1,0,1],   3),
+        ];
+        for (bits, expected) in cases {
+            let bytes = pack_bits(bits);
+            let mut br = BitReader::new(&bytes);
+            assert_eq!(decode_total_zeros_4x4(&mut br, 3).unwrap(), *expected,
+                "TC=3 bits {:?}", bits);
+        }
+    }
+
+    #[test]
+    fn total_zeros_tc_7_codeword_11_decodes_to_5() {
+        // Spec Table 9-7 TC=7: "11" → 5 (notice short codeword for
+        // the most-likely value at high TC).
+        let bytes = pack_bits(&[1, 1]);
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_total_zeros_4x4(&mut br, 7).unwrap(), 5);
     }
 
     #[test]
