@@ -52,23 +52,41 @@ which call returns OutOfScope.
 
 ## What to do next, in priority order
 
-### 1. Fill the rest of the CAVLC tables (the SAD-unlocking work)
+### 1. Fill the rest of the CAVLC tables — DONE (commit pending)
 
-Source: H.264 spec Tables 9-7, 9-9, 9-10. Cross-verify against
-libavcodec's `h264_cavlc.c` to catch transcription errors.
+The hand-transcribed tables in `cavlc.rs` had silent bugs where
+codeword lengths were off in several rows. Replaced wholesale with
+verified values pulled from libavcodec's `h264_cavlc.c` (FFmpeg
+master) via a Python regen script. Now committed:
 
-- `total_zeros` TC=8..=15. Roughly 80 entries. Tables get
-  monotonically smaller as TC rises (fewer possible total_zeros
-  values).
-- `run_before` zl=7..=14. Roughly 60 entries. zl=7..=14 use a
-  fixed-length unary form (each value is encoded as `zeros_left -
-  1` zeros followed by a single 1, capped).
-- `coeff_token` VLC0 TC=15 and TC=16 (8 entries). 16-bit codewords;
-  verify against libavcodec.
+- `COEFF_TOKEN_VLC0` — all 62 entries, TC=0..=16, T1=0..=3.
+- `TZ_TC1` through `TZ_TC15` — all 15 total_zeros tables.
+- `RB_ZL1` through `RB_ZL6` and `RB_ZL_GE7` — full run_before set.
 
-After these land, instrument `decode_residual_block_4x4` to log
-which call returns first when the corpus first fails (if it still
-does). Iterate until SAD starts dropping.
+Plus two level-decoding bugs fixed:
+- `level_prefix >= 15` (not `>= 16`) is the escape threshold for
+  +4096 bias.
+- `levelSuffixSize == 12` (not `suffix_length`) for `level_prefix
+  == 15`.
+
+### 1a. Remaining residual-decode bug
+
+After (1), the corpus's first 4×4 block still fails residual
+decode with `CavlcInvalid`. coeff_token decodes successfully
+(TC=14, T1=0 from bits `0000000000001011`), then `decode_levels`
+or one of the downstream calls fails. Likely candidates:
+
+- A bug in the level prefix/suffix walk (the two fixes above
+  helped but more may remain).
+- A neighbor-nC bug: for the 16×16 corpus all 4×4 blocks except
+  block 0 have a left-neighbor nC, so they should NOT use Vlc0.
+  Currently `decode_macroblock_residuals` always passes Vlc0.
+- A cursor advancement bug somewhere subtle.
+
+Diagnostic to use next session: add a verbose mode to
+`decode_residual_block_4x4` that traces every read step (which
+function called, what bits it read, what value returned). Compare
+side-by-side with libavcodec's runtime trace on the same fixture.
 
 ### 2. Wire chroma reconstruction
 
