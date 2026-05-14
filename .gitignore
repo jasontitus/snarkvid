@@ -16,6 +16,9 @@ spike/common/bench-fixtures/fixture-*.bin.sha256
 # Bench results
 spike/bench/results/
 
+# full_test_gpu.sh / setup logs (regenerated on every run)
+gpu-run.log
+
 # OS
 .DS_Store
 Thumbs.db
