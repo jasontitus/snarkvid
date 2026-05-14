@@ -69,24 +69,67 @@ Plus two level-decoding bugs fixed:
 - `levelSuffixSize == 12` (not `suffix_length`) for `level_prefix
   == 15`.
 
-### 1a. Remaining residual-decode bug
+### 1a. Remaining residual-decode bug — PARTIAL (nC fix landed)
 
-After (1), the corpus's first 4×4 block still fails residual
-decode with `CavlcInvalid`. coeff_token decodes successfully
-(TC=14, T1=0 from bits `0000000000001011`), then `decode_levels`
-or one of the downstream calls fails. Likely candidates:
+Updated after running the new CAVLC trace (env-gated under
+`CAVLC_TRACE=1`, added to `cavlc.rs`):
 
-- A bug in the level prefix/suffix walk (the two fixes above
-  helped but more may remain).
-- A neighbor-nC bug: for the 16×16 corpus all 4×4 blocks except
-  block 0 have a left-neighbor nC, so they should NOT use Vlc0.
-  Currently `decode_macroblock_residuals` always passes Vlc0.
-- A cursor advancement bug somewhere subtle.
+**What we found.** Block 0 of the corpus MB actually does decode
+correctly with Vlc0 (TC=14, T1=0 from `0000000000001011`). The
+failure is downstream: all 16 luma blocks "decode" without erroring,
+but the first **chroma DC** block then fails `read_vlc` against
+`COEFF_TOKEN_CHROMA_DC_420`, so the whole MB falls through to the
+fill-with-`mb_signature(I_NxN)=100` path. That's why every pixel in
+the output is 100 — not because residual decode aborted at block 0,
+but because it aborts at the chroma DC step after silently
+mis-decoding most luma blocks.
 
-Diagnostic to use next session: add a verbose mode to
-`decode_residual_block_4x4` that traces every read step (which
-function called, what bits it read, what value returned). Compare
-side-by-side with libavcodec's runtime trace on the same fixture.
+**Why the luma blocks are wrong.** Pre-fix, `decode_macroblock_
+residuals` always passed `CoeffTokenVariant::Vlc0`. With block 0 at
+TC=14, the nC for block 1 is 14, which per spec §9.2.1.1 picks
+`FixedLen6` (the 6-bit raw code used for nC ≥ 8). The decoder was
+reading those 6-bit blobs as Vlc0 codewords — which "succeeded"
+because Vlc0 has short prefixes that match almost anything — and
+producing nonsense TCs / levels. The bit cursor drifted with every
+block; by the time the decoder got to chroma DC, the cursor was so
+out of sync that no `ChromaDc420` codeword matched.
+
+**What landed.** Added `pick_coeff_token_variant_4x4` to `mb.rs`
+that tracks per-block `TotalCoeff` in raster order across z-scan
+traversal and computes nC from left+top in-MB neighbors. Also added
+`decode_residual_block_4x4_with_tc` to expose the decoded TC so the
+caller can feed it back into the neighbor grid. Inactive CBP_luma
+clusters contribute TotalCoeff=0 (not "unavailable") per the spec.
+
+**What still fails.** Chroma DC still fails. With the nC fix, the
+luma blocks are now consistently picking `FixedLen6` (because the
+first block's high TC cascades into nC ≥ 8 for all subsequent
+blocks). Looking at the trace, every luma block past block 0 reads
+out as TC=14, 15, or 16 — *plausible* for a QP=15-ish noise frame
+but suspicious that they're all saturating. Two leading
+hypotheses for the chroma DC failure:
+
+1. **The luma level decode is consuming the wrong number of bits**
+   somewhere. The trace shows levels like -2073 and 44 at k=4 and
+   k=9 of block 0 — *consistent with the spec algorithm given the
+   bits we read*, but those magnitudes are at the edge of what 8-bit
+   noise plus low-QP quantization could produce. If `decode_levels`
+   under-reads or over-reads by even one bit, the cursor drifts and
+   subsequent blocks (still using FixedLen6 since nC stays high)
+   pull garbage TCs that *look* like saturated 6-bit codes.
+2. **`COEFF_TOKEN_CHROMA_DC_420` table is missing or mis-encoded
+   entries**, so a real codeword in the stream fails to match. Less
+   likely than (1) given the small fixed table, but worth checking
+   against libavcodec's chroma DC table the same way `cavlc.rs`'s
+   luma tables were regenerated.
+
+**Diagnostic still wanted.** Side-by-side trace against libavcodec
+on the same fixture, focused on the chroma DC bit position. Until
+we have ground truth for "what does ffmpeg decode block 0 to,"
+hypothesis (1) vs (2) is hard to call.
+
+The trace infra is in place: `CAVLC_TRACE=1 cargo test
+-p snarkvid-h264-decoder -- --nocapture` emits step-by-step.
 
 ### 2. Wire chroma reconstruction
 

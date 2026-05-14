@@ -277,7 +277,7 @@ pub fn parse_macroblock_header(br: &mut BitReader) -> Result<MacroblockHeader, D
 // clamp) lives in frame.rs because it needs cross-MB neighbor state.
 // ─────────────────────────────────────────────────────────────────────
 
-use crate::cavlc::{decode_residual_block_4x4, CoeffTokenVariant};
+use crate::cavlc::{decode_residual_block_4x4, decode_residual_block_4x4_with_tc, CoeffTokenVariant};
 
 /// Decoded residual data for one I-slice macroblock. Each entry is
 /// 16 dequantized levels in raster order, ready for IDCT. `None`
@@ -324,11 +324,12 @@ impl MacroblockResiduals {
 ///   - cbp.chroma >= 1 → read U/V chroma DC pair (2×2 Hadamard input)
 ///   - cbp.chroma >= 2 → also read U/V chroma AC blocks
 ///
-/// nC selection: a proper implementation derives nC from the neighbor
-/// blocks' TotalCoeff. For a first-pass corpus decode we use Vlc0
-/// (nC < 2), which the spec defines as the fallback when neighbors
-/// are unavailable. This will undercount nC for inner MBs of larger
-/// frames; flagged in TESTING.md as a follow-up.
+/// nC selection per spec §9.2.1.1: each 4×4 block's coeff_token table
+/// variant is picked from the average TotalCoeff of its left + top
+/// neighbor 4×4 blocks (rounded). Block 0 (top-left of MB) has no
+/// in-MB neighbors and falls back to nC=0 (Vlc0). Cross-MB neighbor
+/// state is a follow-up — the 16×16 corpus is a single MB so all
+/// inter-block neighbors live inside the MB.
 pub fn decode_macroblock_residuals(
     br: &mut BitReader,
     header: &MacroblockHeader,
@@ -338,17 +339,19 @@ pub fn decode_macroblock_residuals(
         return Err(DecodeError::OutOfScope("I_PCM residual"));
     }
 
-    // Luma 4×4 blocks. Spec block-scan order is non-trivial; for
-    // baseline 4:2:0 it's the order from spec §6.4.3 / Figure 6-12.
-    // For a first cut we walk in raster order (which is correct for
-    // the all-CBP-bits-set case, modulo the spec's z-scan traversal
-    // which only matters for adjacency-based nC).
+    // TotalCoeff per 4×4 luma block, indexed in *raster* order (sub_y*4 + sub_x).
+    // Filled in as we decode each block in z-scan order; used to compute nC
+    // for subsequent blocks' coeff_token variant selection.
+    let mut luma_tc: [Option<u8>; 16] = [None; 16];
+
     if matches!(header.mb_type, MbType::INxN | MbType::I16x16 { .. }) {
-        // For each 8×8 cluster, check the corresponding CBP_luma bit.
+        // Walk all 4 clusters in block-scan order. An inactive cluster's
+        // blocks contribute TotalCoeff=0 as neighbors of later blocks
+        // (spec §9.2.1.1 — only fully-unavailable blocks short-circuit
+        // to "NULL"; coded blocks with no nonzeros count as 0).
         for cluster in 0..4 {
             let cluster_active = (header.cbp.luma >> cluster) & 1 == 1;
-            if !cluster_active { continue; }
-            // Sub-block indices in this cluster (spec block-scan):
+            // Sub-block indices in this cluster (spec block-scan order):
             //   cluster 0 → blocks 0, 1, 4, 5
             //   cluster 1 → blocks 2, 3, 6, 7
             //   cluster 2 → blocks 8, 9, 12, 13
@@ -361,7 +364,13 @@ pub fn decode_macroblock_residuals(
                 _ => unreachable!(),
             };
             for &blk in &block_indices {
-                let coeffs = decode_residual_block_4x4(br, CoeffTokenVariant::Vlc0)?;
+                if !cluster_active {
+                    luma_tc[blk] = Some(0);
+                    continue;
+                }
+                let variant = pick_coeff_token_variant_4x4(&luma_tc, blk);
+                let (tc, coeffs) = decode_residual_block_4x4_with_tc(br, variant)?;
+                luma_tc[blk] = Some(tc);
                 out.luma_4x4[blk] = Some(coeffs);
             }
         }
@@ -394,6 +403,27 @@ pub fn decode_macroblock_residuals(
     }
 
     Ok(out)
+}
+
+/// Pick the coeff_token table variant for a luma 4×4 block per spec
+/// §9.2.1.1. `luma_tc` is indexed in raster order (sub_y*4 + sub_x).
+/// Returns `Vlc0` if both in-MB neighbors are unavailable (block 0).
+///
+/// Cross-MB neighbor TotalCoeff isn't tracked yet; multi-MB frames will
+/// undercount nC at MB boundaries until that lands. Single-MB corpora
+/// (the 16×16 test fixture) are unaffected.
+fn pick_coeff_token_variant_4x4(luma_tc: &[Option<u8>; 16], blk: usize) -> CoeffTokenVariant {
+    let sub_x = blk % 4;
+    let sub_y = blk / 4;
+    let left = if sub_x > 0 { luma_tc[sub_y * 4 + (sub_x - 1)] } else { None };
+    let top = if sub_y > 0 { luma_tc[(sub_y - 1) * 4 + sub_x] } else { None };
+    let nc: i32 = match (left, top) {
+        (Some(l), Some(t)) => (l as i32 + t as i32 + 1) >> 1,
+        (Some(l), None) => l as i32,
+        (None, Some(t)) => t as i32,
+        (None, None) => 0,
+    };
+    CoeffTokenVariant::from_nc(nc, false)
 }
 
 #[cfg(test)]

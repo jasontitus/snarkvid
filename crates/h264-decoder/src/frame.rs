@@ -473,6 +473,32 @@ mod tests {
     }
 
     #[test]
+    fn dump_y_plane_for_inspection() {
+        // Diagnostic only — prints decoded Y plane next to ffmpeg reference
+        // so we can see WHERE the divergence is (which 4x4 block, which
+        // pixel). Run with --nocapture. Always passes.
+        let frame = decode_iframe(NOISE_16X16_QP18.h264).expect("decode");
+        let ref_y = &NOISE_16X16_QP18.decoded_yuv[0..(16 * 16)];
+        eprintln!("decoded Y vs ffmpeg ref (16x16):");
+        for row in 0..16 {
+            let mut ours = std::string::String::new();
+            let mut theirs = std::string::String::new();
+            let mut diff = std::string::String::new();
+            for col in 0..16 {
+                let idx = row * 16 + col;
+                ours.push_str(&std::format!("{:>3} ", frame.y[idx]));
+                theirs.push_str(&std::format!("{:>3} ", ref_y[idx]));
+                let d = (frame.y[idx] as i32 - ref_y[idx] as i32).abs();
+                diff.push_str(&std::format!("{:>3} ", d));
+            }
+            eprintln!("row {:>2} ours:    {}", row, ours);
+            eprintln!("       ffmpeg:  {}", theirs);
+            eprintln!("       abs(d):  {}", diff);
+            eprintln!();
+        }
+    }
+
+    #[test]
     fn decode_iframe_corpus_y_plane_distance_to_ffmpeg() {
         // Quantifies "how far is our decoder from pixel-correct?"
         //

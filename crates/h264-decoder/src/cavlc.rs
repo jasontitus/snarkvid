@@ -20,6 +20,26 @@
 use crate::bitreader::BitReader;
 use crate::DecodeError;
 
+// Env-gated trace for diagnosing CAVLC parses against libavcodec.
+// Enable with `CAVLC_TRACE=1 cargo test -p snarkvid-h264-decoder -- --nocapture`.
+// No-op in non-test builds (keeps the crate no_std-pure).
+#[cfg(test)]
+fn cavlc_trace_enabled() -> bool {
+    std::env::var_os("CAVLC_TRACE").is_some()
+}
+#[cfg(test)]
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if crate::cavlc::cavlc_trace_enabled() {
+            std::eprintln!($($arg)*);
+        }
+    };
+}
+#[cfg(not(test))]
+macro_rules! trace {
+    ($($arg:tt)*) => {};
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // VLC table primitive
 // ─────────────────────────────────────────────────────────────────────
@@ -382,6 +402,7 @@ pub fn decode_levels(
     total_coeff: u8,
     trailing_ones: u8,
 ) -> Result<[i32; 16], DecodeError> {
+    trace!("decode_levels: TC={} T1={}", total_coeff, trailing_ones);
     let mut levels = [0i32; 16];
     if total_coeff == 0 {
         return Ok(levels);
@@ -398,6 +419,7 @@ pub fn decode_levels(
         let sign = br.read_bit()?;
         let idx = (total_coeff - 1) as usize - i;
         levels[idx] = if sign == 1 { -1 } else { 1 };
+        trace!("  T1 sign[{}]: bit={} → level={}", i, sign, levels[idx]);
     }
 
     let n_levels = (total_coeff - trailing_ones) as usize;
@@ -410,8 +432,10 @@ pub fn decode_levels(
     let mut suffix_length: u32 =
         if total_coeff > 10 && trailing_ones < 3 { 1 } else { 0 };
 
+    trace!("  initial suffix_length={}", suffix_length);
     for k in 0..n_levels {
         let level_prefix = read_level_prefix(br)?;
+        trace!("  k={}: level_prefix={}", k, level_prefix);
 
         // Spec §9.2.2.1 / JM reference:
         //   level_prefix < 14:  levelSuffixSize = suffixLength
@@ -431,6 +455,7 @@ pub fn decode_levels(
         } else {
             0
         };
+        trace!("    level_suffix_size={} level_suffix={}", level_suffix_size, level_suffix);
 
         // Reconstruct the unsigned levelCode (spec §9.2.2.1).
         let mut level_code: i32 = (core::cmp::min(15, level_prefix) << suffix_length) as i32
@@ -460,6 +485,7 @@ pub fn decode_levels(
         // (total_coeff - trailing_ones - 1) toward 0.
         let idx = (total_coeff - trailing_ones) as usize - 1 - k;
         levels[idx] = level;
+        trace!("    level_code={} → level={} (placed at idx {})", level_code, level, idx);
 
         // Update suffix_length for the next iteration.
         if suffix_length == 0 {
@@ -468,6 +494,7 @@ pub fn decode_levels(
         if level.unsigned_abs() > (3u32 << (suffix_length - 1)) && suffix_length < 6 {
             suffix_length += 1;
         }
+        trace!("    new suffix_length={}", suffix_length);
     }
     Ok(levels)
 }
@@ -764,6 +791,7 @@ fn run_before_table(zeros_left: u8) -> Result<&'static [VlcEntry], DecodeError> 
 /// Returns the run length (number of zeros before the next nonzero
 /// in the inverse zig-zag walk).
 pub fn decode_run_before(br: &mut BitReader, zeros_left: u8) -> Result<u8, DecodeError> {
+    trace!("    decode_run_before: zeros_left={}", zeros_left);
     if zeros_left == 0 { return Ok(0); }
     let t = run_before_table(zeros_left)?;
     let v = read_vlc(br, t)?;
@@ -796,7 +824,19 @@ pub fn decode_residual_block_4x4(
     br: &mut BitReader,
     variant: CoeffTokenVariant,
 ) -> Result<[i32; 16], DecodeError> {
+    decode_residual_block_4x4_with_tc(br, variant).map(|(_, c)| c)
+}
+
+/// Like `decode_residual_block_4x4` but also returns the TotalCoeff that
+/// drove the decode. Callers that need to track block-level nC for
+/// neighbor-based variant selection (spec §9.2.1.1) use this form.
+pub fn decode_residual_block_4x4_with_tc(
+    br: &mut BitReader,
+    variant: CoeffTokenVariant,
+) -> Result<(u8, [i32; 16]), DecodeError> {
+    trace!("decode_residual_block_4x4: variant={:?}", variant);
     let ct = decode_coeff_token(br, variant)?;
+    trace!("  coeff_token: TC={} T1={}", ct.total_coeff, ct.trailing_ones);
     let mut levels_zigzag = decode_levels(br, ct.total_coeff, ct.trailing_ones)?;
 
     // Place the levels into their zig-zag positions. `decode_levels`
@@ -808,6 +848,7 @@ pub fn decode_residual_block_4x4(
     // and place coefficients at the right positions.
 
     let total_zeros = decode_total_zeros_4x4(br, ct.total_coeff)?;
+    trace!("  total_zeros={}", total_zeros);
     let mut zeros_left = total_zeros;
     let mut coeff_num: i32 = -1; // counts how far back from highest-freq we are
 
@@ -826,6 +867,7 @@ pub fn decode_residual_block_4x4(
             } else {
                 zeros_left
             };
+            trace!("  i={} run_before={} zeros_left_after={}", i, run, zeros_left);
             coeff_num += (run + 1) as i32;
             // coeff_num counts from highest-frequency end; the zigzag
             // index walking down from k=15 is (15 - coeff_num).
@@ -841,7 +883,7 @@ pub fn decode_residual_block_4x4(
     for k in 0..16 {
         raster[ZIGZAG_4X4[k]] = zz[k];
     }
-    Ok(raster)
+    Ok((ct.total_coeff, raster))
 }
 
 #[cfg(test)]
