@@ -75,22 +75,32 @@ lto = "thin"
 # our downstream consumer resolves the same graph.
 #
 # Source of truth: privacy-scaling-explorations/sonobe Cargo.toml main.
-# Update these revs when you bump the sonobe pin above.
+#
+# WSL/May-2026 patch state: Sonobe's last green CI was 2026-02-19.
+# arkworks-rs/algebra HEAD moved past Release 0.6.0 on 2026-05-12, adding
+# `SmallFp` and breaking trait bounds against ark-groth16 b3b4a15. Pin all
+# algebra crates back to the latest pre-0.6 commit (598a5fb, 2025-12-28).
 [patch.crates-io]
 ark-groth16 = { git = "https://github.com/arkworks-rs/groth16", rev = "b3b4a15" }
-ark-ff = { git = "https://github.com/arkworks-rs/algebra" }
-ark-ec = { git = "https://github.com/arkworks-rs/algebra" }
-ark-serialize = { git = "https://github.com/arkworks-rs/algebra" }
-ark-poly = { git = "https://github.com/arkworks-rs/algebra" }
-ark-relations = { git = "https://github.com/arkworks-rs/snark" }
-ark-snark = { git = "https://github.com/arkworks-rs/snark" }
+ark-ff = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+ark-ec = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+ark-serialize = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+ark-poly = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+ark-relations = { git = "https://github.com/arkworks-rs/snark", rev = "02fed63" }
+ark-snark = { git = "https://github.com/arkworks-rs/snark", rev = "02fed63" }
 ark-crypto-primitives = { git = "https://github.com/flyingnobita/crypto-primitives", rev = "f559264" }
 ark-r1cs-std = { git = "https://github.com/flyingnobita/r1cs-std_yelhousni", rev = "b4bab0c" }
 ark-std = { git = "https://github.com/arkworks-rs/std" }
 ark-poly-commit = { git = "https://github.com/arkworks-rs/poly-commit" }
-ark-bn254 = { git = "https://github.com/arkworks-rs/algebra" }
-ark-grumpkin = { git = "https://github.com/arkworks-rs/algebra" }
-ark-pallas = { git = "https://github.com/arkworks-rs/algebra" }
-ark-vesta = { git = "https://github.com/arkworks-rs/algebra" }
-ark-mnt4-298 = { git = "https://github.com/arkworks-rs/algebra" }
-ark-mnt6-298 = { git = "https://github.com/arkworks-rs/algebra" }
+ark-bn254 = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+ark-grumpkin = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+ark-pallas = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+ark-vesta = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+ark-mnt4-298 = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+ark-mnt6-298 = { git = "https://github.com/arkworks-rs/algebra", rev = "598a5fb" }
+
+# ark-groth16 b3b4a15 has direct git deps on arkworks-rs/crypto-primitives.git
+# (not crates.io). Its HEAD added `SmallFp` and breaks against our pinned
+# ark-ff. Redirect to the flyingnobita fork that pre-dates that change.
+[patch."https://github.com/arkworks-rs/crypto-primitives.git"]
+ark-crypto-primitives = { git = "https://github.com/flyingnobita/crypto-primitives", rev = "f559264" }

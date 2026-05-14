@@ -35,12 +35,21 @@ echo "nvcc: $(nvcc --version | tail -1)"
 
 # ----- System deps -----------------------------------------------------------
 # Lambda images already have build-essential; this is a defensive install.
+# Skip the apt step entirely if every required package is already present,
+# so that re-runs (and WSL boxes without passwordless sudo) don't get stuck.
 if command -v apt-get >/dev/null 2>&1; then
-    echo "Installing build deps via apt..."
-    sudo apt-get update -qq
-    sudo apt-get install -y --no-install-recommends \
-        build-essential pkg-config libssl-dev curl git ca-certificates clang \
-        protobuf-compiler
+    APT_PKGS=(build-essential pkg-config libssl-dev curl git ca-certificates clang protobuf-compiler)
+    MISSING=()
+    for pkg in "${APT_PKGS[@]}"; do
+        dpkg -s "$pkg" >/dev/null 2>&1 || MISSING+=("$pkg")
+    done
+    if [[ ${#MISSING[@]} -eq 0 ]]; then
+        echo "All apt build deps already installed; skipping apt step."
+    else
+        echo "Installing missing build deps via apt: ${MISSING[*]}"
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends "${MISSING[@]}"
+    fi
 fi
 
 # ----- Rust (rustup) ---------------------------------------------------------

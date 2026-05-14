@@ -11,9 +11,17 @@ FILES=(
     "spike/risc0/methods/guest/Cargo.toml"
 )
 
+# sed -i differs between BSD (macOS) and GNU (Linux): BSD requires a
+# backup-suffix argument, GNU treats one as the script. Detect and branch.
+if sed --version >/dev/null 2>&1; then
+    SED_INPLACE=(-i)
+else
+    SED_INPLACE=(-i '')
+fi
+
 for f in "${FILES[@]}"; do
     echo "Uncommenting risc0 deps in $f"
-    sed -i '' -E 's/^# (risc0-zkvm|risc0-build|bincode|snarkvid-spike-risc0)/\1/' "$f"
+    sed "${SED_INPLACE[@]}" -E 's/^# (risc0-zkvm|risc0-build|bincode|snarkvid-spike-risc0)/\1/' "$f"
 done
 
 echo ""

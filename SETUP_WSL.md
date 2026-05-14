@@ -211,6 +211,96 @@ Don't. Clone into the WSL filesystem (`~/snarkvid`, i.e. `\\wsl$\Ubuntu-22.04\ho
 9p filesystem perf for `/mnt/c` is 5–10× slower for cargo workloads
 and will make the RISC Zero compile painful.
 
+## Ubuntu 24.04 / noble specifics
+
+The original draft of this doc targeted Ubuntu 22.04. Ubuntu 24.04 ships
+**gcc 13** as default and an **apt `nvidia-cuda-toolkit` at nvcc 12.0**.
+That combination has a few sharp edges the setup scripts now work around;
+see `scripts/bench_cuda.sh` for the detection logic.
+
+### CUDA layout: `find_cuda_helper` can't see Ubuntu's apt CUDA
+
+Ubuntu's apt package installs to `/usr/bin/nvcc`, `/usr/include/`,
+`/usr/lib/x86_64-linux-gnu/` — **no `/usr/local/cuda` directory**, and
+`/usr/lib/cuda/{bin,lib64}` are empty. RISC Zero's `cust_raw` build
+script uses `find_cuda_helper` which searches `/opt/cuda`,
+`/usr/local/cuda`, and (only as base paths) `$CUDA_LIBRARY_PATH`.
+
+Workaround: build a synthetic CUDA root in `$HOME/cuda` with symlinks
+and set `CUDA_LIBRARY_PATH=$HOME/cuda`. `bench_cuda.sh` auto-detects
+this and exports the right env. To set it up:
+
+```bash
+mkdir -p ~/cuda/bin ~/cuda/lib64 ~/cuda/include
+ln -sf /usr/bin/nvcc ~/cuda/bin/nvcc
+for so in libcudart.so libcudart.so.12 libcuda.so libcuda.so.1; do
+    ln -sf "/usr/lib/x86_64-linux-gnu/$so" ~/cuda/lib64/
+done
+ln -sf /usr/lib/x86_64-linux-gnu/libcudart_static.a ~/cuda/lib64/
+ln -sf /usr/lib/x86_64-linux-gnu/stubs ~/cuda/lib64/stubs
+for h in cuda.h cuda_runtime.h cuda_runtime_api.h; do
+    ln -sf "/usr/include/$h" ~/cuda/include/
+done
+```
+
+### nvcc 12.0 doesn't accept gcc 13+ as host compiler
+
+CUDA 12.0 hard-errors with "unsupported GNU version" against gcc 13 (the
+default on Ubuntu 24.04). Install `gcc-12` / `g++-12` (`sudo apt install
+gcc-12 g++-12`) and add a host-cxx shim directory so `nvcc -ccbin=c++`
+resolves to `g++-12`:
+
+```bash
+mkdir -p ~/cuda/host-cxx
+ln -sf /usr/bin/g++-12 ~/cuda/host-cxx/c++
+ln -sf /usr/bin/gcc-12 ~/cuda/host-cxx/cc
+ln -sf /usr/bin/gcc-12 ~/cuda/host-cxx/gcc
+ln -sf /usr/bin/g++-12 ~/cuda/host-cxx/g++
+```
+
+`bench_cuda.sh` adds this dir to PATH and exports `CC=gcc-12 CXX=g++-12`
+when it sees `~/cuda/host-cxx` exists.
+
+### apt CUDA 12.0 is too old for RISC Zero 3.x kernels (phase 4 / RISC0)
+
+RISC Zero 3.0.5's `risc0-circuit-rv32im-sys` kernels (`steps.cu`,
+`ffi.cu`) require CUDA toolkit features that nvcc 12.0 doesn't support
+("too many identifiers", "no suitable constructor exists to convert from
+`Val [N]` to `Fp`"). **Phase 4 RISC0 will not build on Ubuntu 24.04 apt
+CUDA**, even with the gcc-12 workaround above.
+
+To fix, install NVIDIA's CUDA 12.4+ toolkit from their WSL repo. SP1's
+CUDA path doesn't hit this — SP1's phase 4 row builds and runs fine on
+the apt toolkit.
+
+### SP1 6.2 doesn't actually need Docker
+
+The original doc warned that SP1's CUDA backend falls back to CPU
+without Docker. As of SP1 **6.2.0**, `sp1up` installs the GPU server as
+a host binary; it's spawned as a subprocess, not a container. Docker
+Desktop is no longer required.
+
+### Phase 7 (Sonobe) is broken upstream
+
+The Sonobe spike won't build right now regardless of platform.
+`folding-schemes` main pulls in `ark-groth16` rev `b3b4a15` (Aug 2025),
+which calls `cs.borrow()` on `ark_relations::ConstraintSystemRef` —
+since then `ark-relations` tightened the trait bound to
+`gr1cs::Field`, and `ark-groth16` has not been updated to match.
+
+Partial fix in `spike/sonobe/Cargo.toml` redirects
+`arkworks-rs/crypto-primitives.git` to the flyingnobita fork and pins
+`arkworks-rs/algebra` to the latest pre-0.6.0 commit, but the
+`ark-groth16` / snark gap can't be closed without forking ark-groth16
+or waiting for upstream. Phase 8 (Decider) cascades from phase 7.
+
+### Sudo-less re-runs of `setup_linux_cuda.sh`
+
+The setup script's apt step now skips entirely if all required build
+deps are already present (`dpkg -s` check). After a first sudo-ful
+install of `clang protobuf-compiler` etc., re-runs of the setup don't
+need a TTY for sudo. Useful inside non-interactive Claude Code shells.
+
 ## Comparing 3090 numbers to the M1 / A10 reference
 
 Same JSON schema as everywhere else; pair them with `compare.py`:

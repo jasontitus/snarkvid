@@ -8,6 +8,21 @@ cd "$(dirname "$0")/.."
 # Toolchain shims; CUDA toolkit on PATH for any cargo-driven C++/nvcc compile.
 export PATH="$HOME/.cargo/bin:$HOME/.sp1/bin:/usr/local/cuda/bin:$PATH"
 
+# WSL / Ubuntu-noble fallbacks: if /usr/local/cuda doesn't exist but $HOME/cuda
+# was populated (see SETUP_WSL.md), point find_cuda_helper at it via the env
+# vars that crate honors on Linux (CUDA_LIBRARY_PATH for lib search, CUDA_PATH
+# for include search). Also force gcc-12 as nvcc's host compiler — CUDA 12.0
+# refuses gcc 13+ which is the default on Ubuntu 24.04.
+if [[ ! -d /usr/local/cuda && -d "$HOME/cuda/lib64" ]]; then
+    export PATH="$HOME/cuda/host-cxx:$HOME/cuda/bin:$PATH"
+    export CUDA_PATH="$HOME/cuda"
+    export CUDA_HOME="$HOME/cuda"
+    export CUDA_ROOT="$HOME/cuda"
+    export CUDA_LIBRARY_PATH="$HOME/cuda"
+    [[ -x /usr/bin/gcc-12 ]] && export CC=gcc-12
+    [[ -x /usr/bin/g++-12 ]] && export CXX=g++-12
+fi
+
 # SP1 picks the prover backend at runtime via this env var. The cuda backend
 # is only available when sp1-sdk was compiled with --features cuda (below).
 export SP1_PROVER="${SP1_PROVER:-cuda}"
